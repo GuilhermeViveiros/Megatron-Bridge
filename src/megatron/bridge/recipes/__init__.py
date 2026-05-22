@@ -21,6 +21,7 @@ This module exposes all recipe configurations from all model families.
 from megatron.bridge.diffusion.recipes.flux.flux import *
 from megatron.bridge.diffusion.recipes.wan.wan import *
 from megatron.bridge.recipes.deepseek import *
+from megatron.bridge.recipes.euro_vl import *
 from megatron.bridge.recipes.gemma import *
 from megatron.bridge.recipes.gemma3_vl import *
 from megatron.bridge.recipes.gemma4_vl import *
