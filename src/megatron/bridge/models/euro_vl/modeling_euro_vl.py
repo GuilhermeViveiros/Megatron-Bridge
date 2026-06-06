@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -20,13 +21,16 @@ import torch.nn.functional as F
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
-from transformers import AutoModel
 
+from megatron.bridge.models.euro_vl.moonvit.modeling_moonvit import MoonVitPretrainedModel
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import (
     hook_hf_module_setattr_for_tp_grad_sync,
     slice_batch_for_context_parallel,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
@@ -73,9 +77,12 @@ class EuroVLModel(MegatronModule):
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_process = post_process
+        self._vision_dtype = config.params_dtype
 
         if pre_process:
-            self.vision_tower = AutoModel.from_config(config.vision_config, trust_remote_code=True)
+            # Build the vendored MoonViT vision tower from the in-repo config object
+            # (no AutoConfig/AutoModel, no trust_remote_code).
+            self.vision_tower = MoonVitPretrainedModel(config.vision_config).to(config.params_dtype)
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
 
             self.multi_modal_projector = EuroVLProjector(
@@ -113,12 +120,18 @@ class EuroVLModel(MegatronModule):
                 p.requires_grad = False
 
     def _compute_bidirectional_attention_mask(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
-        """Build a causal mask with bidirectional attention within each image token block.
+        """Build a causal mask with bidirectional attention within each vision block.
+
+        A vision block spans from ``<|vision_start|>`` to ``<|vision_end|>`` inclusive,
+        covering the delimiter tokens and all ``<image>`` placeholders between them.
+        All positions within the same vision block attend to each other bidirectionally;
+        all other positions follow standard causal masking.
 
         Only used when config.use_bidirectional_image_attention=True.  Default is pure
         causal (attention_mask=None), which lets Megatron Core handle masking normally.
 
-        @TODO: Double check this implementation.
+        @TODO: Verify attention mask sign convention against Megatron Core's expectation
+               (True = blocked vs True = allowed) before enabling this code path.
         """
         if not self.pre_process:
             return None
@@ -126,10 +139,21 @@ class EuroVLModel(MegatronModule):
         causal_mask = torch.tril(
             torch.ones((batch_size, 1, seq_len, seq_len), device=input_ids.device)
         )
-        image_mask = input_ids == self.config.image_token_id
-        padded = F.pad(image_mask, (1, 0), value=0)
-        boundary = padded[:, 1:] > padded[:, :-1]
-        block_idx = image_mask * torch.cumsum(boundary, dim=-1)
+
+        # Assign a unique block index to every token inside a vision block
+        # (<|vision_start|>, <image>*N, <|vision_end|>).  Tokens outside any
+        # vision block get block_idx=0 and are excluded from bidirectional attention.
+        vision_start = (input_ids == self.config.vision_start_token_id)
+        vision_end   = (input_ids == self.config.vision_end_token_id)
+        # Cumulative count of opened blocks minus closed blocks gives in-block flag.
+        opened = torch.cumsum(vision_start, dim=-1)
+        closed = torch.cumsum(vision_end.roll(1, dims=-1).masked_fill(
+            torch.arange(seq_len, device=input_ids.device) == 0, False
+        ), dim=-1)
+        in_block = (opened - closed) > 0
+        # Use opened as block ID (unique per vision block).
+        block_idx = opened * in_block  # 0 outside blocks, ≥1 inside
+
         bidirectional = torch.logical_and(
             block_idx[:, None, :] == block_idx.unsqueeze(-1),
             block_idx.unsqueeze(-1) > 0,
@@ -143,7 +167,7 @@ class EuroVLModel(MegatronModule):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
-        grid_hws: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional["PackedSeqParams"] = None,
@@ -155,22 +179,32 @@ class EuroVLModel(MegatronModule):
         Args:
             input_ids: Token ids, shape [B, T].  Must contain image_token_id placeholders.
             pixel_values: Packed pixel patches for MoonViT, shape [total_patches, C, H, W].
-            grid_hws: Per-image grid dimensions, shape [num_images, 2] (height, width in patches).
+            image_grid_thw: Per-image grid dimensions, shape [num_images, 3] (t, height, width
+                in patches). MoonViT is 2D-only so t=1; the temporal dim is stripped before the
+                vision tower. Kept in the codebase-wide ``image_grid_thw`` form for the shared
+                FLOPs counter.
             labels: Shifted token ids for cross-entropy loss.
             loss_mask: Boolean mask selecting positions that contribute to the loss.
 
         Returns:
             Tuple of (model_output, loss_mask) where loss_mask may be CP-sliced.
         """
+        #import pdb; pdb.set_trace()
         if self.pre_process:
             if inputs_embeds is None:
                 inputs_embeds = self.language_model.embedding(
                     input_ids=input_ids, position_ids=None
-                ).transpose(0, 1).contiguous()
+                ) # [decoder_seq_len, b, h_language]
 
-            if pixel_values is not None and grid_hws is not None:
+                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
+
+            if pixel_values is not None and image_grid_thw is not None:
+                pixel_values = pixel_values.to(self._vision_dtype)
+                # MoonViT is 2D-only: drop the (unit) temporal dim -> [num_images, 2] (h, w).
+                grid_hws = image_grid_thw[:, 1:]
                 image_features = self.vision_tower(pixel_values, grid_hws)
-                all_image_features = torch.cat(image_features, dim=0)
+                # MoonViT returns List[Tensor[N_i, merge_k*merge_k, hidden]] — flatten merge dim.
+                all_image_features = torch.cat(image_features, dim=0).flatten(1)
                 projected = self.multi_modal_projector(all_image_features).to(inputs_embeds.dtype)
 
                 special_image_mask = (

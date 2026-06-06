@@ -65,6 +65,18 @@ class TokenizerConfig(MTrainTokenizerConfig):
         # Don't pad vocab size since MBridge does it's own padding
         self.pad_vocab_size = False
 
+        # MCore's _set_padded_vocab_size / vocab_size_with_padding reads these fields
+        # directly from the args object.  Provide defaults so the tokenizer build
+        # path doesn't crash when TokenizerConfig is used stand-alone (e.g. during
+        # checkpoint assembly) rather than via the full training argument namespace.
+        if not hasattr(self, "make_vocab_size_divisible_by"):
+            self.make_vocab_size_divisible_by = 128
+        if not hasattr(self, "tensor_model_parallel_size"):
+            self.tensor_model_parallel_size = 1
+        if not hasattr(self, "rank"):
+            self.rank = 0
+        
+
         # HuggingFace tokenizer kwargs
         self.tokenizer_hf_no_use_fast = not self.hf_tokenizer_kwargs.get("use_fast", True)
         self.tokenizer_hf_no_include_special_tokens = not self.hf_tokenizer_kwargs.get("include_special_tokens", True)

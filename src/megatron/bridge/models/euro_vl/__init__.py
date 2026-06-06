@@ -12,15 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.euro_vl_bridge import EuroVLBridge
-from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider, IMAGE_TOKEN_ID
+from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
 from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel, EuroVLProjector
+from megatron.bridge.models.euro_vl.euro_vl_processor import EuroVLProcessor
+from megatron.bridge.models.euro_vl.modeling_euro_vl_hf import (
+    EuroVLForConditionalGeneration,
+    EuroVLMultiModalProjector,
+)
+from megatron.bridge.models.euro_vl.utils import compute_moonvit_visual_tokens
 
 
 __all__ = [
     "EuroVLBridge",
+    "EuroVLConfig",
+    "EuroVLForConditionalGeneration",
     "EuroVLModel",
     "EuroVLModelProvider",
+    "EuroVLMultiModalProjector",
+    "EuroVLProcessor",
     "EuroVLProjector",
-    "IMAGE_TOKEN_ID",
+    "compute_moonvit_visual_tokens",
 ]

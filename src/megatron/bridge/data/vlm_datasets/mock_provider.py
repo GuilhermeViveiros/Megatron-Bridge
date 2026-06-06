@@ -130,14 +130,16 @@ class MockVLMConversationProvider(DatasetProvider):
     def build_datasets(self, context: DatasetBuildContext):
         from transformers import AutoProcessor
 
-        # Initialize and store processor
-        self._processor = AutoProcessor.from_pretrained(
-            self.hf_processor_path,
-            trust_remote_code=is_safe_repo(
-                trust_remote_code=self.trust_remote_code,
-                hf_path=self.hf_processor_path,
-            ),
-        )
+        # Allow callers to pre-assign a custom processor (e.g. EuroVLProcessor)
+        # before build_datasets is called. Only fall back to AutoProcessor if not set.
+        if self._processor is None:
+            self._processor = AutoProcessor.from_pretrained(
+                self.hf_processor_path,
+                trust_remote_code=is_safe_repo(
+                    trust_remote_code=self.trust_remote_code,
+                    hf_path=self.hf_processor_path,
+                ),
+            )
 
         base_examples = self._make_base_examples()
 

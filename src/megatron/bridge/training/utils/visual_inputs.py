@@ -134,3 +134,31 @@ class Qwen2AudioInputs:
     def normalized_for_model(self) -> dict[str, torch.Tensor]:
         """Return non-None fields (no shape normalization needed for audio)."""
         return self.as_model_kwargs()
+
+
+@dataclass
+class EuroVLVisualInputs:
+    """Container for EuroVL visual modality tensors (MoonViT).
+
+    Fields match ``EuroVLModel.forward()`` kwargs directly — no shape
+    normalization needed since the processor already packs patches.
+    """
+
+    pixel_values: Optional[torch.Tensor] = None  # [total_patches, C, pH, pW]
+    # [num_images, 3] = (t, h, w). MoonViT is 2D-only so t=1; the 3D form matches the
+    # codebase-wide name the shared FLOPs counter (vlm_step) reads. The model forward
+    # strips the temporal dim before MoonViT.
+    image_grid_thw: Optional[torch.Tensor] = None
+
+    def as_model_kwargs(self) -> dict[str, torch.Tensor]:
+        """Return a mapping of non-None fields suitable for model forward kwargs."""
+        result: dict[str, torch.Tensor] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is not None:
+                result[f.name] = value
+        return result
+
+    def normalized_for_model(self) -> dict[str, torch.Tensor]:
+        """Return non-None fields — no shape normalization needed."""
+        return self.as_model_kwargs()

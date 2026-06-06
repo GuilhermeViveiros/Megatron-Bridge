@@ -12,27 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EuroVL bridge — weight mappings for the EuroLLM language model component.
+"""EuroVL bridge — converts the EuroVL HF checkpoint to Megatron.
 
-EuroVL is trained from scratch: there is no pre-existing HF VLM checkpoint to
-convert from.  This bridge provides:
+Standard HF -> Megatron bridge for ``EuroVLForConditionalGeneration`` (assembled
+by ``eurollm_bridge.py``). It maps three components:
 
-  1. Llama-style weight mappings under the ``language_model.*`` prefix so that
-     a pretrained EuroLLM-1.7B checkpoint can be imported into the LLM component
-     of a freshly initialised EuroVL model.
-  2. A ``provider_bridge()`` that builds an ``EuroVLModelProvider`` with the
-     correct LLM architecture settings derived from an EuroLLM HF config.
+  - ``language_model.*``         (Megatron GPT decoder)  <-  EuroLLM (Llama) weights
+  - ``vision_tower.*``           (vendored MoonViT)       <-  1:1 copy (same module)
+  - ``multi_modal_projector.*``  (MLP projector)          <-  1:1 copy (same module)
 
-Usage — load EuroLLM weights into EuroVL's language model::
-
-    from megatron.bridge.models.euro_vl import EuroVLBridge
-    bridge = EuroVLBridge()
-    provider = bridge.provider_bridge(eurollm_hf_pretrained)
-    # provider.vision_config must be set before calling provide()
+The vision tower and projector are the *same* nn.Modules on both sides, so they
+copy verbatim; only the Llama decoder needs the usual QKV/GatedMLP fusions.
 """
 
+from typing import List
+
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
@@ -40,33 +36,30 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
 from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel
-from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 
 @MegatronModelBridge.register_bridge(
-    source="EuroLLMForCausalLM",  # string — no HF VLM class exists yet
+    source="EuroVLForConditionalGeneration",
     target=EuroVLModel,
     provider=EuroVLModelProvider,
     model_type="euro_vl",
 )
 class EuroVLBridge(MegatronModelBridge):
-    """Bridge for loading EuroLLM weights into the EuroVL language model component.
+    """Bridge converting an EuroVL HF checkpoint to the Megatron EuroVL model."""
 
-    Weight mappings mirror LlamaBridge but with the ``language_model.`` prefix that
-    Megatron uses for the LLM sub-module inside a VLM.
-    """
+    def provider_bridge(self, hf_pretrained) -> EuroVLModelProvider:
+        """Build EuroVLModelProvider from an EuroVL HF config.
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> EuroVLModelProvider:
-        """Build EuroVLModelProvider from an EuroLLM-1.7B HF config.
-
-        Reads LLM architecture from the HF config and applies Llama-specific
-        Megatron settings.  ``vision_config`` is left as ``None`` and must be
-        set by the caller before instantiating the model.
+        Reads LLM architecture from ``text_config`` and VLM-specific fields
+        (vision_config, token ids, tie_word_embeddings) from the top-level config.
         """
-        provider_kwargs = self.hf_config_to_provider_kwargs(hf_pretrained.config)
+        hf_config = hf_pretrained.config
+        text_config = hf_config.text_config
+
+        provider_kwargs = self.hf_config_to_provider_kwargs(text_config)
         provider = EuroVLModelProvider(**provider_kwargs)
 
-        # Llama-specific Megatron settings (mirrors LlamaBridge.provider_bridge)
+        # Llama / EuroLLM Megatron settings (mirror LlamaBridge).
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
         provider.hidden_dropout = 0.0
@@ -76,44 +69,68 @@ class EuroVLBridge(MegatronModelBridge):
         provider.bias_dropout_fusion = True
         provider.apply_rope_fusion = True
         provider.rotary_percent = 1.0
-        # Extend vocab for <image> token; Megatron pads internally via make_vocab_size_divisible_by
-        provider.vocab_size = 128001
+        provider.position_embedding_type = "rope"
+        provider.add_bias_linear = False
+        provider.add_qkv_bias = False
 
-        # vision_config must be provided by the caller
-        provider.vision_config = None
+        # tie_word_embeddings lives on the TOP-LEVEL config (EuroLLM is untied).
+        provider.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
+
+        # Vision + projector + token ids from the top-level config.
+        provider.vision_config = hf_config.vision_config
+        provider.projector_input_dim = hf_config.projector_input_dim
+        provider.projector_output_dim = hf_config.projector_output_dim
+        provider.image_token_id = hf_config.image_token_id
+        provider.vision_start_token_id = hf_config.vision_start_token_id
+        provider.vision_end_token_id = hf_config.vision_end_token_id
+        provider.vision_pad_token_id = hf_config.vision_pad_token_id
+        provider.video_token_id = hf_config.video_token_id
 
         return provider
 
+    def build_conversion_tasks(self, hf_pretrained, megatron_model) -> List[WeightConversionTask]:
+        # Defensive: drop any unmapped (None) tasks so base iteration doesn't crash.
+        tasks = super().build_conversion_tasks(hf_pretrained, megatron_model)
+        return [t for t in tasks if t is not None]
+
     def mapping_registry(self) -> MegatronMappingRegistry:
-        """Llama weight mappings under the language_model.* prefix used in EuroVL."""
+        """Weight mappings: EuroLLM (Llama) decoder + 1:1 vision tower & projector.
+
+        HF side nests the language model under ``language_model.`` (a
+        ``LlamaForCausalLM``), so HF keys are ``language_model.model.*`` /
+        ``language_model.lm_head.weight``.
+        """
         auto_mappings = {
-            "language_model.embedding.word_embeddings.weight": "model.embed_tokens.weight",
-            "language_model.output_layer.weight": "lm_head.weight",
-            "language_model.decoder.final_layernorm.weight": "model.norm.weight",
+            "language_model.embedding.word_embeddings.weight": "language_model.model.embed_tokens.weight",
+            "language_model.output_layer.weight": "language_model.lm_head.weight",
+            "language_model.decoder.final_layernorm.weight": "language_model.model.norm.weight",
             # TE implementation layer norms
-            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.input_layernorm.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "language_model.model.layers.*.input_layernorm.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "language_model.model.layers.*.post_attention_layernorm.weight",
             # Local (non-TE) implementation layer norms
-            "language_model.decoder.layers.*.input_layernorm.weight": "model.layers.*.input_layernorm.weight",
-            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": "model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.input_layernorm.weight": "language_model.model.layers.*.input_layernorm.weight",
+            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": "language_model.model.layers.*.post_attention_layernorm.weight",
             # Attention output and MLP down projections
-            "language_model.decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_proj.weight": "language_model.model.layers.*.self_attn.o_proj.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc2.weight": "language_model.model.layers.*.mlp.down_proj.weight",
         }
         mappings = [AutoMapping(megatron_param=m, hf_param=h) for m, h in auto_mappings.items()]
         mappings.extend(
             [
                 QKVMapping(
                     megatron_param="language_model.decoder.layers.*.self_attention.linear_qkv.weight",
-                    q="model.layers.*.self_attn.q_proj.weight",
-                    k="model.layers.*.self_attn.k_proj.weight",
-                    v="model.layers.*.self_attn.v_proj.weight",
+                    q="language_model.model.layers.*.self_attn.q_proj.weight",
+                    k="language_model.model.layers.*.self_attn.k_proj.weight",
+                    v="language_model.model.layers.*.self_attn.v_proj.weight",
                 ),
                 GatedMLPMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.linear_fc1.weight",
-                    gate="model.layers.*.mlp.gate_proj.weight",
-                    up="model.layers.*.mlp.up_proj.weight",
+                    gate="language_model.model.layers.*.mlp.gate_proj.weight",
+                    up="language_model.model.layers.*.mlp.up_proj.weight",
                 ),
+                # Vision tower and projector are identical modules on both sides: copy 1:1.
+                AutoMapping(megatron_param="vision_tower.**", hf_param="vision_tower.**"),
+                AutoMapping(megatron_param="multi_modal_projector.**", hf_param="multi_modal_projector.**"),
             ]
         )
         return MegatronMappingRegistry(*mappings)

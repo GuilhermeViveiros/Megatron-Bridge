@@ -21,12 +21,6 @@ from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 
-# Token ID of the new <image> special token added to EuroLLM's vocabulary.
-# EuroLLM vocab_size=128000; <image> is appended at index 128000,
-# and vocab_size is padded to 128128 (next multiple of 128).
-IMAGE_TOKEN_ID: int = 128000
-
-
 @dataclass
 class EuroVLModelProvider(GPTModelProvider):
     """Model provider for EuroVL (MoonViT + EuroLLM).
@@ -39,7 +33,9 @@ class EuroVLModelProvider(GPTModelProvider):
     # embeddings are inserted into the sequence after the embedding lookup.
     scatter_embedding_sequence_parallel: bool = False
 
-    # MoonViT config object (MoonViTConfig).  Set before calling provide().
+    # Vendored MoonViT vision-encoder config (MoonViTConfig). In-repo class, so it
+    # serializes cleanly into run_config.yaml (no transformers_modules namespace) and
+    # is readable by the FLOPs calculator.
     vision_config: Optional[Any] = None
 
     # MoonViT hidden_size=1152, merge_kernel_size=[2,2] → 4*1152=4608 per merged token.
@@ -47,8 +43,13 @@ class EuroVLModelProvider(GPTModelProvider):
     # EuroLLM hidden_size.
     projector_output_dim: int = 2048
 
-    # Token ID used as image placeholder in the text sequence.
-    image_token_id: int = IMAGE_TOKEN_ID
+    # Vision special tokens appended to EuroLLM's vocabulary (base vocab_size=128000).
+    # Vocab is padded to the next multiple of 128 → 128128.
+    image_token_id: int = 128000        # <image>           — per-image-token placeholder
+    vision_start_token_id: int = 128001  # <|vision_start|>  — block start delimiter
+    vision_end_token_id: int = 128002    # <|vision_end|>    — block end delimiter
+    vision_pad_token_id: int = 128003    # <|vision_pad|>    — vision sequence padding
+    video_token_id: int = 128004         # <video>           — per-video-frame placeholder
 
     # Attention strategy for image token positions in the LLM decoder.
     # False (default): pure causal masking — simplest baseline.
