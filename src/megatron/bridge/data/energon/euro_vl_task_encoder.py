@@ -14,70 +14,61 @@
 
 """Energon task encoder for EuroVL (MoonViT + EuroLLM).
 
-EuroVL data is curated as a **CrudeWebdataset**: each sample is a raw ``{key}.jpg``
-plus a ``{key}.json`` metadata blob (NeMo-Curator layout). "Crude" means energon
-hands the task encoder the undecoded sample, so this encoder implements
-``cook_crude_sample`` to turn it into a :class:`ChatMLSample`, then reuses the
-generic :class:`HFEncoderVLMTaskEncoder` machinery (which drives ``EuroVLProcessor``
-for joint tokenization + MoonViT preprocessing and emits ``GenericVisualInputs``
-with ``pixel_values`` + ``image_grid_thw``).
+EuroVL data is curated as a **CrudeWebdataset** with a single, category-agnostic
+sample structure: each sample is a raw ``{key}.jpg`` plus a ``{key}.json`` that
+already holds the full ChatML conversation
+(``[{"role": "user", "content": "<image>\\n..."}, {"role": "assistant", ...}]``).
+The same layout is used for captioning, VQA, OCR, etc. — only the conversation
+content differs — so a single cooker handles every source.
 
-The same encoder serves every crude EuroVL source; per-source text construction is
-selected by ``task`` (captioning today; extend for VQA/OCR).
+"Crude" means energon does not decode the sample; this encoder registers a
+:class:`~megatron.energon.Cooker` that decodes the image and passes the conversation
+through into a :class:`ChatMLSample`, then reuses the generic
+:class:`HFEncoderVLMTaskEncoder` machinery (which drives ``EuroVLProcessor`` for
+joint tokenization + MoonViT preprocessing and emits ``GenericVisualInputs`` with
+``pixel_values`` + ``image_grid_thw``).
 """
 
 import io
 import json
 from typing import Any, Optional
 
+import torch
+from megatron.energon import Cooker, basic_sample_keys
 from PIL import Image
 
-from megatron.bridge.data.energon.hf_encoder_task_encoder import HFEncoderVLMTaskEncoder
-from megatron.bridge.data.energon.task_encoder_utils import ChatMLSample
+from megatron.bridge.data.energon.hf_encoder_task_encoder import HFEncoderTaskSample, HFEncoderVLMTaskEncoder
+from megatron.bridge.data.energon.task_encoder_utils import IGNORE_INDEX, ChatMLSample, cook_chatml_sample
+from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
+from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 
 
-# Extensions we look for in a crude sample, in priority order.
+# Crude-sample extensions to look for, in priority order.
 _IMAGE_EXTS = ("jpg", "jpeg", "png", "image")
-_META_EXTS = ("json", "caption", "txt")
+_CONVERSATION_EXTS = ("json", "conversation", "txt")
 
 
-def _crude_get(sample: Any, keys: tuple[str, ...]) -> Optional[Any]:
-    """Return the first present key from a crude energon sample (dict-like)."""
+def _crude_get(sample: dict, keys: tuple[str, ...]) -> Optional[Any]:
+    """Return the first present key from a crude energon sample dict."""
     for k in keys:
-        if isinstance(sample, dict):
-            if k in sample:
-                return sample[k]
-        elif hasattr(sample, k):
-            return getattr(sample, k)
+        if k in sample:
+            return sample[k]
     return None
 
 
-def _crude_meta(sample: Any, key: str, default: Any = None) -> Any:
-    """Read an energon sample metadata field (``__key__`` etc.) defensively."""
-    if isinstance(sample, dict):
-        return sample.get(key, default)
-    return getattr(sample, key, default)
-
-
 class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
-    """Crude-sample task encoder for EuroVL captioning/VQA datasets.
+    """Crude-sample task encoder for EuroVL energon datasets.
+
+    Category-agnostic: every source shares the same crude structure (``jpg`` +
+    ``json`` conversation), so one cooker serves captioning, VQA, OCR, etc.
 
     Args:
         processor: An ``EuroVLProcessor`` (supports ``apply_chat_template`` and
             ``__call__(text=, images=)`` returning ``pixel_values`` + ``image_grid_thw``).
         seq_length: Maximum sequence length (tokens truncated to this).
-        task: Source task type controlling conversation construction. ``"captioning"``
-            builds a single user(``<image>`` + prompt) / assistant(caption) turn.
-        prompt: Instruction text paired with the image for captioning samples.
     """
 
-    def __init__(
-        self,
-        processor,
-        seq_length: int = 4096,
-        task: str = "captioning",
-        prompt: str = "Describe this image.",
-    ) -> None:
+    def __init__(self, processor, seq_length: int = 4096) -> None:
         # EuroVLProcessor returns pixel_values + image_grid_thw (3D, t=1); capture both
         # so GenericVisualInputs forwards them to EuroVLModel and the FLOP counter sees the grid.
         super().__init__(
@@ -85,45 +76,69 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             seq_length=seq_length,
             visual_keys=("pixel_values", "image_grid_thw"),
         )
-        if task != "captioning":
-            raise ValueError(f"EuroVLTaskEncoder currently supports task='captioning', got {task!r}")
-        self.task = task
-        self.prompt = prompt
+        # Register the cooker that decodes a crude sample into a ChatMLSample. A bound
+        # method is picklable (the encoder itself is sent to dataloader workers).
+        self.cookers = [Cooker(cook=self._cook)]
 
-    def cook_crude_sample(self, sample: Any) -> ChatMLSample:
-        """Decode a raw crude sample (``jpg`` + ``json``) into a :class:`ChatMLSample`.
+    def _cook(self, sample: dict) -> ChatMLSample:
+        """Decode a crude sample (``jpg`` + ``json`` conversation) into a :class:`ChatMLSample`.
 
-        The ``json`` blob holds at least a ``caption`` (NeMo-Curator metadata). The
-        result is a single-turn captioning conversation; the image is passed as a PIL
-        image (``HFEncoderVLMTaskEncoder`` handles PIL via ``_images_to_pil``).
+        Energon's webdataset decoder already turns ``jpg`` into a CHW tensor and ``json``
+        into a parsed object, so we pass those through: ``HFEncoderVLMTaskEncoder``
+        converts the image tensor to PIL (``_images_to_pil``) and ``cook_chatml_sample``
+        parses the conversation. Raw-bytes inputs are handled too, in case a different
+        energon decode config is used.
         """
         raw_img = _crude_get(sample, _IMAGE_EXTS)
         if raw_img is None:
-            raise KeyError(f"crude sample has no image (looked for {_IMAGE_EXTS}); key={_crude_meta(sample, '__key__')}")
-        image = raw_img if isinstance(raw_img, Image.Image) else Image.open(io.BytesIO(raw_img)).convert("RGB")
+            raise KeyError(f"crude sample has no image (looked for {_IMAGE_EXTS}); keys={list(sample.keys())}")
+        # tensor / PIL -> pass through (converted to PIL downstream); bytes -> decode here.
+        if isinstance(raw_img, (bytes, bytearray)):
+            raw_img = Image.open(io.BytesIO(raw_img)).convert("RGB")
 
-        raw_meta = _crude_get(sample, _META_EXTS)
-        if isinstance(raw_meta, (bytes, bytearray)):
-            raw_meta = raw_meta.decode("utf-8")
-        if isinstance(raw_meta, str):
-            try:
-                meta = json.loads(raw_meta)
-            except json.JSONDecodeError:
-                meta = {"caption": raw_meta}
-        else:
-            meta = raw_meta or {}
-        caption = meta.get("caption", "") if isinstance(meta, dict) else str(meta)
-
-        conversation = [
-            {"from": "human", "value": f"<image>\n{self.prompt}"},
-            {"from": "gpt", "value": caption},
-        ]
+        raw_conv = _crude_get(sample, _CONVERSATION_EXTS)
+        if raw_conv is None:
+            raise KeyError(f"crude sample has no conversation (looked for {_CONVERSATION_EXTS}); keys={list(sample.keys())}")
+        if isinstance(raw_conv, (bytes, bytearray)):
+            raw_conv = raw_conv.decode("utf-8")
+        # ChatMLSample.conversation is a JSON string; serialize if energon already parsed it.
+        if not isinstance(raw_conv, str):
+            raw_conv = json.dumps(raw_conv)
 
         return ChatMLSample(
-            __key__=_crude_meta(sample, "__key__", ""),
-            __restore_key__=_crude_meta(sample, "__restore_key__", ()),
-            __subflavor__=_crude_meta(sample, "__subflavor__", None),
-            __subflavors__=_crude_meta(sample, "__subflavors__", {}) or {},
-            conversation=json.dumps(conversation),
-            imgs=[image],
+            **basic_sample_keys(sample),
+            conversation=raw_conv,
+            imgs=[raw_img],
         )
+
+    def encode_sample(self, sample: ChatMLSample) -> HFEncoderTaskSample:
+        """Encode like the generic HF encoder, but build the loss mask with the
+        repo-standard search helper.
+
+        The base ``HFEncoderVLMTaskEncoder`` masks via a naive exact-token search of the
+        standalone assistant text, which fails for EuroLLM's SentencePiece tokenizer (a
+        response following a newline tokenizes without its leading ``▁``). We reuse
+        ``create_multiturn_loss_mask_by_search`` — the same helper every VLM collate uses
+        (qwen2_5, glm4v, ministral3, the EuroVL mock path) — which searches the *final*
+        ``input_ids`` (robust to ``<image>`` expansion) with newline-context candidates.
+        """
+        encoded = super().encode_sample(sample)
+
+        conversation = cook_chatml_sample(sample.conversation)
+        skipped = extract_skipped_token_ids(self.processor)
+        mask = create_multiturn_loss_mask_by_search(
+            {"conversation": conversation}, encoded.input_ids, self.processor, skipped
+        )
+        loss_mask = torch.tensor(mask, dtype=torch.float32)
+
+        # Shift to align the loss with next-token labels (same convention as the base encoder).
+        shifted = torch.zeros_like(loss_mask)
+        shifted[:-1] = loss_mask[1:]
+        labels = encoded.input_ids.clone().to(torch.long)
+        labels[:-1] = encoded.input_ids[1:].to(torch.long)
+        labels[-1] = IGNORE_INDEX
+        labels[shifted == 0] = IGNORE_INDEX
+
+        encoded.loss_mask = shifted
+        encoded.labels = labels
+        return encoded

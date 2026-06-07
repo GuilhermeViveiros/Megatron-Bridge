@@ -221,7 +221,6 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
     task_encoder = EuroVLTaskEncoder(
         processor=processor,
         seq_length=cfg.model.seq_length,
-        task="captioning",
     )
     cfg.dataset = EnergonProvider(
         path="",  # REQUIRED at launch: dataset.path=<energon dataset dir or metadataset.yaml>
