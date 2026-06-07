@@ -96,9 +96,10 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         features = torch.cat(features, dim=0).flatten(1)
         return self.multi_modal_projector(features)
 
-    def get_image_features(self, pixel_values: torch.Tensor, image_grid_hws: torch.Tensor) -> torch.Tensor:
-        """Projected tokens for images. ``image_grid_hws`` is [num_images, 2] = (h, w)."""
-        return self._encode(pixel_values, image_grid_hws)
+    def get_image_features(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        """Projected tokens for images. ``image_grid_thw`` is [num_images, 3] = (t=1, h, w);
+        MoonViT is 2D, so the unit temporal dim is dropped before encoding."""
+        return self._encode(pixel_values, image_grid_thw[:, 1:])
 
     def get_video_features(self, pixel_values_videos: torch.Tensor, video_grid_thw: torch.Tensor) -> torch.Tensor:
         """Projected tokens for videos.
@@ -119,7 +120,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
-        image_grid_hws: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         video_grid_thw: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -131,8 +132,8 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        if pixel_values is not None and image_grid_hws is not None:
-            image_features = self.get_image_features(pixel_values, image_grid_hws).to(inputs_embeds.dtype)
+        if pixel_values is not None and image_grid_thw is not None:
+            image_features = self.get_image_features(pixel_values, image_grid_thw).to(inputs_embeds.dtype)
             image_mask = (
                 (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             )

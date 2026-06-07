@@ -184,8 +184,8 @@ class EuroVLProcessor(ProcessorMixin):
 
         Returns:
             BatchFeature with ``input_ids``, ``attention_mask``, and (when present)
-            ``pixel_values`` + ``image_grid_hws`` and/or ``pixel_values_videos`` +
-            ``video_grid_thw``.
+            ``pixel_values`` + ``image_grid_thw`` (``[num_images, 3]`` = (1, h, w)) and/or
+            ``pixel_values_videos`` + ``video_grid_thw``.
         """
         if text is None:
             raise ValueError("`text` is required.")
@@ -263,7 +263,13 @@ class EuroVLProcessor(ProcessorMixin):
         data = {**text_inputs}
         if image_inputs:
             data["pixel_values"] = image_inputs["pixel_values"]
-            data["image_grid_hws"] = torch.as_tensor(np.asarray(image_inputs["image_grid_hws"]))
+            # MoonViT is 2D, but emit the codebase-standard image_grid_thw [num_images, 3]
+            # by prepending a unit temporal dim (t=1) to the (h, w) grid. This makes the
+            # collate, energon task encoder, shared FLOP counter, and model all read a
+            # single name; consumers that need the 2D grid slice ``[:, 1:]``.
+            hw = torch.as_tensor(np.asarray(image_inputs["image_grid_hws"]))  # [num_images, 2]
+            t = torch.ones((hw.shape[0], 1), dtype=hw.dtype)
+            data["image_grid_thw"] = torch.cat([t, hw], dim=-1)  # [num_images, 3] = (1, h, w)
         if video_inputs:
             data["pixel_values_videos"] = video_inputs["pixel_values_videos"]
             data["video_grid_thw"] = torch.as_tensor(np.asarray(video_inputs["video_grid_thw"]))

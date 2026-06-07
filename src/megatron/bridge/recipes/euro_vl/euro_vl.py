@@ -192,3 +192,44 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
     # cfg.checkpoint.pretrained_checkpoint = "/path/to/checkpoint"
 
     return cfg
+
+
+# =============================================================================
+# EuroVL 2B SFT — Megatron-Energon data path
+# =============================================================================
+def euro_vl_2b_sft_energon_config() -> ConfigContainer:
+    """SFT config for EuroVL-2B reading a Megatron-Energon (Crude) dataset.
+
+    Reuses :func:`euro_vl_2b_sft_config` (model / parallelism / optimizer), then swaps
+    the mock dataset for an ``EnergonProvider`` driven by ``EuroVLTaskEncoder``
+    (crude ``jpg`` + ``json`` -> captioning conversation -> ``EuroVLProcessor``).
+
+    Set the data path at launch — a single prepared dataset, or an energon
+    *metadataset* YAML for a weighted multi-source blend::
+
+        dataset.path=/path/to/energon-data/image/captioning/flickr30k
+
+    Energon imports are local so the other EuroVL recipes do not require
+    ``megatron-energon`` to be installed.
+    """
+    from megatron.bridge.data.energon.energon_provider import EnergonProvider
+    from megatron.bridge.data.energon.euro_vl_task_encoder import EuroVLTaskEncoder
+
+    cfg = euro_vl_2b_sft_config()
+
+    processor = EuroVLProcessor.from_pretrained(_EUROVL_HF)
+    task_encoder = EuroVLTaskEncoder(
+        processor=processor,
+        seq_length=cfg.model.seq_length,
+        task="captioning",
+    )
+    cfg.dataset = EnergonProvider(
+        path="",  # REQUIRED at launch: dataset.path=<energon dataset dir or metadataset.yaml>
+        seq_length=cfg.model.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        global_batch_size=cfg.train.global_batch_size,
+        num_workers=8,
+        task_encoder=task_encoder,
+        pack_sequences_in_batch=False,
+    )
+    return cfg

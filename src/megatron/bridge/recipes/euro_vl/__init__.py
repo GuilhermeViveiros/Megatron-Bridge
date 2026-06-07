@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.recipes.euro_vl.euro_vl import euro_vl_2b_sft_config
+from megatron.bridge.recipes.euro_vl.euro_vl import (
+    euro_vl_2b_sft_config,
+    euro_vl_2b_sft_energon_config,
+)
 
 
 __all__ = [
     "euro_vl_2b_sft_config",
+    "euro_vl_2b_sft_energon_config",
 ]

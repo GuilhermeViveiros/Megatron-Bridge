@@ -1408,18 +1408,11 @@ def euro_vl_collate_fn(examples: list, processor) -> dict:
         torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).clone().contiguous()
     )
 
-    # MoonViT's processor returns a 2D [num_images, 2] (h, w) grid. Promote it to the
-    # codebase-wide 3D image_grid_thw [num_images, 3] = (t=1, h, w) so the shared FLOPs
-    # counter (vlm_step) reads it like every other VLM; the model strips t for MoonViT.
-    image_grid_hws = batch.get("image_grid_hws")
-    image_grid_thw = None
-    if image_grid_hws is not None:
-        t = torch.ones((image_grid_hws.shape[0], 1), dtype=image_grid_hws.dtype, device=image_grid_hws.device)
-        image_grid_thw = torch.cat([t, image_grid_hws], dim=-1)
-
+    # EuroVLProcessor already emits the codebase-standard image_grid_thw [num_images, 3]
+    # = (t=1, h, w) (MoonViT is 2D; t is a unit dim). Pass it straight through.
     visual_inputs = EuroVLVisualInputs(
         pixel_values=batch.get("pixel_values"),
-        image_grid_thw=image_grid_thw,
+        image_grid_thw=batch.get("image_grid_thw"),
     )
 
     return {
