@@ -198,21 +198,27 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
 # EuroVL 2B SFT — Megatron-Energon data path
 # =============================================================================
 def euro_vl_2b_sft_energon_config() -> ConfigContainer:
-    """SFT config for EuroVL-2B reading a Megatron-Energon (Crude) dataset.
+    """SFT config for EuroVL-2B over a Megatron-Energon (Crude) weighted blend.
 
     Reuses :func:`euro_vl_2b_sft_config` (model / parallelism / optimizer), then swaps
-    the mock dataset for an ``EnergonProvider`` driven by ``EuroVLTaskEncoder``
-    (crude ``jpg`` + ``json`` -> captioning conversation -> ``EuroVLProcessor``).
+    the mock dataset for a ``EuroVLEnergonProvider`` driven by ``EuroVLTaskEncoder``
+    (crude ``jpg`` + ``json`` ChatML -> ``EuroVLProcessor``).
 
-    Set the data path at launch — a single prepared dataset, or an energon
-    *metadataset* YAML for a weighted multi-source blend::
+    The data mix is built at runtime from a directory of prepared datasets (``root``)
+    and a ``mixture`` spec, both set at launch::
 
-        dataset.path=/path/to/energon-data/image/captioning/flickr30k
+        dataset.root=/path/to/energon-data                      # required
+        dataset.mixture=""                                      # all datasets, equal weight (default)
+        dataset.mixture="cc3m=0.5,coco-caption=0.3"             # weighted subset
+        dataset.mixture="image/captioning=1.0"                  # a whole category
+
+    Weights are relative sampling proportions (energon normalizes them). For a single
+    dataset, pass ``dataset.mixture="<name>=1.0"``.
 
     Energon imports are local so the other EuroVL recipes do not require
     ``megatron-energon`` to be installed.
     """
-    from megatron.bridge.data.energon.energon_provider import EnergonProvider
+    from megatron.bridge.data.energon.euro_vl_energon_provider import EuroVLEnergonProvider
     from megatron.bridge.data.energon.euro_vl_task_encoder import EuroVLTaskEncoder
 
     cfg = euro_vl_2b_sft_config()
@@ -222,8 +228,10 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
         processor=processor,
         seq_length=cfg.model.seq_length,
     )
-    cfg.dataset = EnergonProvider(
-        path="",  # REQUIRED at launch: dataset.path=<energon dataset dir or metadataset.yaml>
+    cfg.dataset = EuroVLEnergonProvider(
+        path="",  # generated at runtime from root + mixture
+        root="",  # REQUIRED at launch: dataset.root=<energon-data dir>
+        mixture="",  # empty = every dataset under root at equal weight
         seq_length=cfg.model.seq_length,
         micro_batch_size=cfg.train.micro_batch_size,
         global_batch_size=cfg.train.global_batch_size,
