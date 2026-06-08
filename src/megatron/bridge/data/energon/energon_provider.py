@@ -25,7 +25,7 @@ from megatron.bridge.data.utils import DatasetBuildContext, DatasetProvider
 class EnergonProvider(DatasetProvider):
     """Energon Provider."""
 
-    path: str
+    path: str = ""  # may be generated at runtime by a subclass (e.g. EuroVLEnergonProvider)
     image_processor: Optional[Any] = None
     seq_length: int
     micro_batch_size: int

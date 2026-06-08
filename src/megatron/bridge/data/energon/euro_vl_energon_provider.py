@@ -12,35 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EuroVL Energon provider with a dynamic, weighted multi-source blend.
+"""EuroVL Energon provider with an InternVL-style repeat-factor data blend.
 
-Generates a Megatron-Energon ``MetadatasetV2`` at runtime from a directory tree of
-prepared datasets plus a ``mixture`` spec, so the data mix is fully controllable from
-the launch command (CLI overrides land after recipe build, hence runtime generation).
+Builds a Megatron-Energon ``MetadatasetV2`` at runtime from a directory of prepared
+datasets (``root``) plus a ``mixture`` of per-dataset **repeat factors** ``r``, so the
+mix is fully controllable from the launch command (CLI overrides land after recipe
+build, hence runtime generation).
 
-Layout expected under ``root`` (any depth)::
+Repeat factor (InternVL): ``r_i`` is how many epochs of dataset *i* to use, so its
+**effective sample count is ``r_i * size_i``**. ``r<1`` down-samples (use a fraction),
+``r>1`` up-samples (repeat), ``r=0`` excludes, ``r=1`` is one natural epoch. Because the
+contribution is ``r_i * size_i``, the total is determinate and the max training steps can
+be computed a priori::
 
-    energon-data/image/captioning/cc3m/.nv-meta
-    energon-data/image/captioning/coco-caption/.nv-meta
-    energon-data/image/vqa/a-okvqa/.nv-meta
+    total_samples = Σ (r_i * size_i)
+    train_iters   = ceil(epochs * total_samples / global_batch_size)
+    step_share_i  = (r_i * size_i) / total_samples
 
-``mixture`` is a comma-separated ``key=weight`` spec. ``key`` matches, in order:
-its dataset name (leaf dir, e.g. ``cc3m``), its path relative to ``root``
-(``image/captioning/cc3m``), or a **category prefix** (``image/captioning``) which
-expands to every dataset beneath it at the given weight. Weights are relative
-sampling proportions (energon normalizes them). An empty ``mixture`` selects **every**
-discovered dataset at weight 1.0 (i.e. all data, equal blend).
+Energon's native ``weight`` is a size-independent sampling proportion, so repeat-factor
+semantics are realized by setting ``weight_i = r_i * size_i`` (energon then samples each
+source with probability ``step_share_i``).
 
-Examples::
+The repeat factors come from ``mixture_file`` — a YAML of ``key: r`` entries, optionally
+grouped by category for readability. Every discovered dataset starts at ``r=1`` and listed
+keys override it (so you only tweak a few; ``r=0`` drops one). ``key`` matches a dataset
+name (leaf dir), a path relative to ``root``, or a category prefix (applies to all
+datasets beneath it). A missing file leaves every dataset at ``r=1`` (one epoch each)::
 
-    dataset.mixture=""                              # all datasets, equal weight
-    dataset.mixture="cc3m=0.5,coco-caption=0.3"     # only these two, weighted
-    dataset.mixture="image/captioning=1.0"          # all captioning datasets
+    image/captioning:
+      cc12m: 0.3
+      coco-caption: 1.5
+      sharegpt4o: 2.0
 """
 
 import hashlib
 import logging
+import math
 import os
+import sqlite3
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,17 +60,20 @@ from megatron.bridge.data.energon.energon_provider import EnergonProvider
 
 logger = logging.getLogger(__name__)
 
+_MAX_REPEAT_FACTOR = 4.0  # InternVL uses r in (0, 4]; we also allow r=0 to exclude.
+
 
 @dataclass(kw_only=True)
 class EuroVLEnergonProvider(EnergonProvider):
-    """EnergonProvider that builds a weighted blend metadataset from ``root`` + ``mixture``."""
+    """EnergonProvider that builds a repeat-factor weighted blend from ``root`` + ``mixture_file``."""
 
     # Root directory holding prepared energon datasets (dirs with a ``.nv-meta`` subdir).
-    root: str = ""
-    # Comma-separated ``key=weight`` spec; empty selects all datasets at equal weight.
-    mixture: str = ""
-    # Where to write the generated metadataset YAML. Defaults to a content-hashed file
-    # under ``root`` (idempotent across ranks). Override if ``root`` is not writable.
+    root: str
+    # YAML file of per-dataset repeat factors (optionally grouped by category).
+    mixture_file: str
+    # Epochs over the (repeat-factor-weighted) blend; drives auto train_iters. None disables.
+    epochs: Optional[float] = 1.0
+    # Where to write the generated metadataset YAML (defaults to ``root``).
     metadataset_dir: Optional[str] = None
 
     def _discover_datasets(self) -> dict[str, str]:
@@ -79,41 +91,93 @@ class EuroVLEnergonProvider(EnergonProvider):
             raise ValueError(f"No prepared energon datasets (.nv-meta) found under {self.root}.")
         return found
 
-    def _resolve_mixture(self, datasets: dict[str, str]) -> list[tuple[str, float]]:
-        """Resolve the mixture spec into a list of (absolute_path, weight)."""
-        if not self.mixture.strip():
-            return [(path, 1.0) for path in sorted(datasets.values())]
+    @staticmethod
+    def _dataset_size(path: str) -> int:
+        """Indexed sample count of a prepared energon dataset (from .nv-meta/index.sqlite)."""
+        idx = os.path.join(path, ".nv-meta", "index.sqlite")
+        if not os.path.exists(idx):
+            raise FileNotFoundError(f"{idx} not found — is {path} prepared (energon prepare)?")
+        con = sqlite3.connect(f"file:{idx}?mode=ro", uri=True)
+        try:
+            return int(con.execute("select count(*) from samples").fetchone()[0])
+        finally:
+            con.close()
 
-        # name -> path and relpath -> path, for key matching.
+    @staticmethod
+    def _flatten_mixture_yaml(data) -> dict[str, float]:
+        """Flatten a (possibly category-nested) mixture YAML into {key: repeat_factor}.
+
+        A mapping value is a category group (recurse); a numeric value is a repeat factor
+        for that key (a dataset name or a category prefix).
+        """
+        flat: dict[str, float] = {}
+        if not isinstance(data, dict):
+            raise ValueError("mixture_file must contain a mapping (optionally nested by category).")
+        for key, val in data.items():
+            if isinstance(val, dict):
+                flat.update(EuroVLEnergonProvider._flatten_mixture_yaml(val))
+            else:
+                flat[str(key)] = float(val)
+        return flat
+
+    def _resolve_repeat_factors(self, datasets: dict[str, str]) -> dict[str, float]:
+        """Resolve the mixture_file into {absolute_path: repeat_factor} (datasets default to 1.0)."""
+        factors: dict[str, float] = {p: 1.0 for p in datasets.values()}
         by_relpath = {os.path.relpath(p, os.path.abspath(self.root)): p for p in datasets.values()}
-        selected: dict[str, float] = {}
-        for item in self.mixture.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "=" not in item:
-                raise ValueError(f"Mixture item {item!r} must be 'key=weight'.")
-            key, w = item.split("=", 1)
-            key, weight = key.strip(), float(w)
+
+        def apply(key: str, r: float) -> None:
+            if not (0.0 <= r <= _MAX_REPEAT_FACTOR):
+                raise ValueError(f"repeat factor for {key!r} must be in [0, {_MAX_REPEAT_FACTOR}], got {r}")
             if key in datasets:  # leaf dataset name
-                selected[datasets[key]] = weight
+                targets = [datasets[key]]
             elif key in by_relpath:  # relative path to a dataset
-                selected[by_relpath[key]] = weight
-            else:  # category prefix -> expand to all datasets beneath it
+                targets = [by_relpath[key]]
+            else:  # category prefix -> all datasets beneath it
                 prefix = key.strip("/") + "/"
-                matched = [p for rel, p in by_relpath.items() if rel.startswith(prefix)]
-                if not matched:
+                targets = [p for rel, p in by_relpath.items() if rel.startswith(prefix)]
+                if not targets:
                     raise ValueError(
                         f"Mixture key {key!r} matched no dataset or category under {self.root}. "
-                        f"Available datasets: {sorted(datasets)}"
+                        f"Available: {sorted(datasets)}"
                     )
-                for p in matched:
-                    selected[p] = weight
-        return sorted(selected.items())
+            for p in targets:
+                factors[p] = r
 
-    def _write_metadataset(self, blend: list[tuple[str, float]]) -> str:
-        """Write a MetadatasetV2 YAML for the blend and return its path."""
-        refs = [{"path": path, "weight": weight} for path, weight in blend]
+        # Apply the per-dataset repeat factors from the mixture YAML (convention:
+        # energon-data/mixture.yaml). If absent, every dataset stays at r=1.
+        if os.path.exists(self.mixture_file):
+            with open(self.mixture_file) as f:
+                for key, r in self._flatten_mixture_yaml(yaml.safe_load(f) or {}).items():
+                    apply(key, r)
+        else:
+            logger.warning("mixture_file %s not found; using default repeat factors (r=1).", self.mixture_file)
+        return factors
+
+    def _resolve_blend(self, datasets: dict[str, str]) -> list[tuple[str, float, int, float]]:
+        """Return [(path, repeat_factor, size, effective_samples)] for non-excluded datasets."""
+        factors = self._resolve_repeat_factors(datasets)
+        blend = []
+        for path in sorted(factors):
+            r = factors[path]
+            if r <= 0.0:
+                continue  # excluded
+            size = self._dataset_size(path)
+            blend.append((path, r, size, r * size))
+        if not blend:
+            raise ValueError("Mixture excluded every dataset (all repeat factors are 0).")
+        return blend
+
+    def compute_train_iters(self, global_batch_size: int) -> Optional[int]:
+        """Auto max-steps: ceil(epochs * Σ(r_i * size_i) / global_batch_size). None if epochs unset."""
+        if self.epochs is None:
+            return None
+        blend = self._resolve_blend(self._discover_datasets())
+        total = sum(eff for _, _, _, eff in blend)
+        return max(1, math.ceil(self.epochs * total / global_batch_size))
+
+    def _write_metadataset(self, blend: list[tuple[str, float, int, float]]) -> str:
+        """Write a MetadatasetV2 YAML using energon weights = r_i * size_i; return its path."""
+        refs = [{"path": path, "weight": float(eff)} for path, _, _, eff in blend]
         doc = {
             "__module__": "megatron.energon",
             "__class__": "MetadatasetV2",
@@ -121,7 +185,6 @@ class EuroVLEnergonProvider(EnergonProvider):
         }
         out_dir = self.metadataset_dir or self.root
         os.makedirs(out_dir, exist_ok=True)
-        # Content-hashed name so concurrent ranks write identical bytes (idempotent).
         digest = hashlib.sha1(yaml.safe_dump(doc, sort_keys=True).encode()).hexdigest()[:12]
         out_path = os.path.join(out_dir, f"euro_vl_blend_{digest}.metadataset.yaml")
         with open(out_path, "w") as f:
@@ -129,14 +192,19 @@ class EuroVLEnergonProvider(EnergonProvider):
         return out_path
 
     def build_datasets(self, context):
-        """Generate the blend metadataset, point ``path`` at it, then defer to EnergonProvider."""
-        datasets = self._discover_datasets()
-        blend = self._resolve_mixture(datasets)
+        """Generate the repeat-factor blend metadataset, point ``path`` at it, then defer to base."""
+        blend = self._resolve_blend(self._discover_datasets())
+        total = sum(eff for *_, eff in blend)
         self.path = self._write_metadataset(blend)
+        lines = [
+            f"  r={r:g}  size={size:,}  eff={eff:,.0f}  step%={100 * eff / total:5.1f}  {os.path.basename(p)}"
+            for p, r, size, eff in blend
+        ]
         logger.info(
-            "EuroVL blend: %d dataset(s) -> %s\n%s",
+            "EuroVL blend (InternVL repeat factors): %d dataset(s), total_eff=%.0f -> %s\n%s",
             len(blend),
+            total,
             self.path,
-            "\n".join(f"  weight={w:g}  {p}" for p, w in blend),
+            "\n".join(lines),
         )
         return super().build_datasets(context)

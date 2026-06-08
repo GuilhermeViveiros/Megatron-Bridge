@@ -1223,6 +1223,17 @@ class ConfigContainer(Container):
             self.dataset.micro_batch_size = self.train.micro_batch_size
             self.dataset.global_batch_size = self.train.global_batch_size
 
+        # Epoch-driven dataset providers (e.g. EuroVLEnergonProvider with epochs set) can
+        # derive train_iters from the data: train_iters = ceil(epochs * Σ(r_i*size_i) / GBS).
+        # When they return a value it overrides the configured train_iters, and the LR decay
+        # horizon is matched to it.
+        if self.dataset is not None and hasattr(self.dataset, "compute_train_iters"):
+            auto_iters = self.dataset.compute_train_iters(self.train.global_batch_size)
+            if auto_iters is not None:
+                self.train.train_iters = auto_iters
+                if self.scheduler is not None and getattr(self.scheduler, "lr_decay_iters", None):
+                    self.scheduler.lr_decay_iters = auto_iters
+
         # Eval batch size divisibility check
         eval_dp_product = self.validation.eval_micro_batch_size * self.data_parallel_size
         assert self.validation.eval_global_batch_size % eval_dp_product == 0, (

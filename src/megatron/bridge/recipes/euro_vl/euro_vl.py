@@ -43,7 +43,12 @@ _SCRATCH = os.environ["SCRATCH"]
 # Assembled EuroVL HF checkpoint (from eurollm_bridge.py): holds the tokenizer
 # (vision tokens + chat template) and the MoonViT image-processor config. Set
 # cfg.checkpoint.pretrained_checkpoint to this to load weights via the bridge.
-_EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_hf"
+EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_hf"
+# Root of the prepared Energon datasets (energon-data/). Static default; override per
+# launch with dataset.root=... or the EUROVL_ENERGON_ROOT env var.
+EUROVL_ENERGON_ROOT = os.environ.get(
+    "EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data"
+)
 
 
 def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
@@ -155,10 +160,10 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
     # tokenizer (vision tokens + chat template) and MoonViT image-processor config
     # from the single assembled HF checkpoint dir. Replace with
     # HFDatasetConversationProvider + real data for actual training.
-    processor = EuroVLProcessor.from_pretrained(_EUROVL_HF)
+    processor = EuroVLProcessor.from_pretrained(EUROVL_HF)
     cfg.dataset = MockVLMConversationProvider(
         seq_length=4096,
-        hf_processor_path=_EUROVL_HF,  # used only as a key; processor is pre-built
+        hf_processor_path=EUROVL_HF,  # used only as a key; processor is pre-built
         image_size=(385, 356),
         num_images=1,
         pack_sequences_in_batch=False,
@@ -167,7 +172,7 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
 
     # To load the assembled EuroVL weights (instead of random init), point the bridge
     # at the HF checkpoint; it converts HF -> Megatron at setup time:
-    # cfg.checkpoint.pretrained_checkpoint = _EUROVL_HF
+    # cfg.checkpoint.pretrained_checkpoint = EUROVL_HF
 
     # DDP settings
     cfg.ddp.overlap_grad_reduce = False
@@ -204,16 +209,17 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
     the mock dataset for a ``EuroVLEnergonProvider`` driven by ``EuroVLTaskEncoder``
     (crude ``jpg`` + ``json`` ChatML -> ``EuroVLProcessor``).
 
-    The data mix is built at runtime from a directory of prepared datasets (``root``)
-    and a ``mixture`` spec, both set at launch::
+    The data mix is built at runtime from a directory of prepared datasets (``root``) and
+    ``mixture.yaml`` in that directory — InternVL-style **repeat factors** ``r`` per dataset
+    (epochs per dataset; effective samples = ``r * size``; ``r=0`` excludes; ``r in [0,4]``).
+    Edit ``energon-data/mixture.yaml`` to control the blend; a missing file = all ``r=1``::
 
-        dataset.root=/path/to/energon-data                      # required
-        dataset.mixture=""                                      # all datasets, equal weight (default)
-        dataset.mixture="cc3m=0.5,coco-caption=0.3"             # weighted subset
-        dataset.mixture="image/captioning=1.0"                  # a whole category
+        image/captioning:
+          cc12m: 0.3
+          sharegpt4o: 2.0
 
-    Weights are relative sampling proportions (energon normalizes them). For a single
-    dataset, pass ``dataset.mixture="<name>=1.0"``.
+    ``epochs`` (default 1) auto-derives ``train_iters = ceil(epochs * Σ(r*size) / GBS)``,
+    so you don't hand-set steps. The provider logs each dataset's r / size / step-share.
 
     Energon imports are local so the other EuroVL recipes do not require
     ``megatron-energon`` to be installed.
@@ -223,15 +229,15 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
 
     cfg = euro_vl_2b_sft_config()
 
-    processor = EuroVLProcessor.from_pretrained(_EUROVL_HF)
+    processor = EuroVLProcessor.from_pretrained(EUROVL_HF)
     task_encoder = EuroVLTaskEncoder(
         processor=processor,
         seq_length=cfg.model.seq_length,
     )
     cfg.dataset = EuroVLEnergonProvider(
-        path="",  # generated at runtime from root + mixture
-        root="",  # REQUIRED at launch: dataset.root=<energon-data dir>
-        mixture="",  # empty = every dataset under root at equal weight
+        root=EUROVL_ENERGON_ROOT,
+        mixture_file=os.path.join(EUROVL_ENERGON_ROOT, "mixture.yaml"),
+        epochs=1.0,  # train_iters auto-computed = ceil(epochs * Σ(r*size) / GBS); set dataset.epochs
         seq_length=cfg.model.seq_length,
         micro_batch_size=cfg.train.micro_batch_size,
         global_batch_size=cfg.train.global_batch_size,
