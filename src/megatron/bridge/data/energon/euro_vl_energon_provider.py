@@ -21,23 +21,28 @@ build, hence runtime generation).
 
 Repeat factor (InternVL): ``r_i`` is how many epochs of dataset *i* to use, so its
 **effective sample count is ``r_i * size_i``**. ``r<1`` down-samples (use a fraction),
-``r>1`` up-samples (repeat), ``r=0`` excludes, ``r=1`` is one natural epoch. Because the
-contribution is ``r_i * size_i``, the total is determinate and the max training steps can
-be computed a priori::
+``r>1`` up-samples (repeat), ``r=0`` excludes, ``r=1`` is one natural epoch. The per-source
+step share is::
 
-    total_samples = Σ (r_i * size_i)
-    train_iters   = ceil(epochs * total_samples / global_batch_size)
-    step_share_i  = (r_i * size_i) / total_samples
+    step_share_i = (r_i * size_i) / Σ_j (r_j * size_j)
 
 Energon's native ``weight`` is a size-independent sampling proportion, so repeat-factor
 semantics are realized by setting ``weight_i = r_i * size_i`` (energon then samples each
 source with probability ``step_share_i``).
 
+.. note::
+    ``train_iters`` is **not** auto-derived from the blend. With fill-to-``seq_length``
+    packing each training step consumes a variable number of samples (≈ ``seq_length`` /
+    avg-sample-length), so a sample-count → step estimate is ill-defined here. Set
+    ``cfg.train.train_iters`` explicitly at launch. A packing-aware epochs→train_iters
+    convenience (and a wall-clock estimate) is a tracked follow-up.
+
 The repeat factors come from ``mixture_file`` — a YAML of ``key: r`` entries, optionally
-grouped by category for readability. Every discovered dataset starts at ``r=1`` and listed
-keys override it (so you only tweak a few; ``r=0`` drops one). ``key`` matches a dataset
-name (leaf dir), a path relative to ``root``, or a category prefix (applies to all
-datasets beneath it). A missing file leaves every dataset at ``r=1`` (one epoch each)::
+grouped by category for readability. The file is the explicit list (**opt-in**): only the
+datasets it names are used, and a dataset you omit/comment is **excluded** (``r=0`` also
+drops one explicitly). ``key`` matches a dataset name (leaf dir), a path relative to
+``root``, or a category prefix (applies to all datasets beneath it). A **missing** file
+falls back to using every discovered dataset at ``r=1`` (one epoch each)::
 
     image/captioning:
       cc12m: 0.3
@@ -47,9 +52,9 @@ datasets beneath it). A missing file leaves every dataset at ``r=1`` (one epoch 
 
 import hashlib
 import logging
-import math
 import os
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -71,8 +76,10 @@ class EuroVLEnergonProvider(EnergonProvider):
     root: str
     # YAML file of per-dataset repeat factors (optionally grouped by category).
     mixture_file: str
-    # Epochs over the (repeat-factor-weighted) blend; drives auto train_iters. None disables.
-    epochs: Optional[float] = 1.0
+    # Energon fill-to-seq_length packing toggle (default on). When True, uses
+    # ``packing_buffer_size`` and requires ``micro_batch_size==1`` (asserted in the base).
+    # Set ``dataset.pack_to_seq_length=false`` to train without packing.
+    pack_to_seq_length: bool = True
     # Where to write the generated metadataset YAML (defaults to ``root``).
     metadataset_dir: Optional[str] = None
 
@@ -121,9 +128,16 @@ class EuroVLEnergonProvider(EnergonProvider):
         return flat
 
     def _resolve_repeat_factors(self, datasets: dict[str, str]) -> dict[str, float]:
-        """Resolve the mixture_file into {absolute_path: repeat_factor} (datasets default to 1.0)."""
-        factors: dict[str, float] = {p: 1.0 for p in datasets.values()}
+        """Resolve the mixture_file into {absolute_path: repeat_factor}.
+
+        The mixture file is the explicit source of truth (opt-in): only datasets it lists are
+        used, each with its repeat factor ``r`` — ``r=0`` discards, ``0<r<1`` subsamples,
+        ``r>1`` oversamples (effective samples = ``r * size``). Datasets **not listed are not
+        in the blend** (omit/comment a dataset to drop it). A **missing** mixture file falls
+        back to using every discovered dataset at ``r=1``.
+        """
         by_relpath = {os.path.relpath(p, os.path.abspath(self.root)): p for p in datasets.values()}
+        factors: dict[str, float] = {}  # built only from the file; unlisted datasets stay out
 
         def apply(key: str, r: float) -> None:
             if not (0.0 <= r <= _MAX_REPEAT_FACTOR):
@@ -143,14 +157,17 @@ class EuroVLEnergonProvider(EnergonProvider):
             for p in targets:
                 factors[p] = r
 
-        # Apply the per-dataset repeat factors from the mixture YAML (convention:
-        # energon-data/mixture.yaml). If absent, every dataset stays at r=1.
         if os.path.exists(self.mixture_file):
             with open(self.mixture_file) as f:
                 for key, r in self._flatten_mixture_yaml(yaml.safe_load(f) or {}).items():
                     apply(key, r)
+            listed = {os.path.basename(p) for p in factors}
+            dropped = sorted(name for name in datasets if name not in listed)
+            if dropped:
+                logger.info("Mixture excludes %d unlisted dataset(s): %s", len(dropped), ", ".join(dropped))
         else:
-            logger.warning("mixture_file %s not found; using default repeat factors (r=1).", self.mixture_file)
+            logger.warning("mixture_file %s not found; using all discovered datasets at r=1.", self.mixture_file)
+            factors = {p: 1.0 for p in datasets.values()}
         return factors
 
     def _resolve_blend(self, datasets: dict[str, str]) -> list[tuple[str, float, int, float]]:
@@ -167,14 +184,6 @@ class EuroVLEnergonProvider(EnergonProvider):
             raise ValueError("Mixture excluded every dataset (all repeat factors are 0).")
         return blend
 
-    def compute_train_iters(self, global_batch_size: int) -> Optional[int]:
-        """Auto max-steps: ceil(epochs * Σ(r_i * size_i) / global_batch_size). None if epochs unset."""
-        if self.epochs is None:
-            return None
-        blend = self._resolve_blend(self._discover_datasets())
-        total = sum(eff for _, _, _, eff in blend)
-        return max(1, math.ceil(self.epochs * total / global_batch_size))
-
     def _write_metadataset(self, blend: list[tuple[str, float, int, float]]) -> str:
         """Write a MetadatasetV2 YAML using energon weights = r_i * size_i; return its path."""
         refs = [{"path": path, "weight": float(eff)} for path, _, _, eff in blend]
@@ -187,12 +196,33 @@ class EuroVLEnergonProvider(EnergonProvider):
         os.makedirs(out_dir, exist_ok=True)
         digest = hashlib.sha1(yaml.safe_dump(doc, sort_keys=True).encode()).hexdigest()[:12]
         out_path = os.path.join(out_dir, f"euro_vl_blend_{digest}.metadataset.yaml")
-        with open(out_path, "w") as f:
-            yaml.safe_dump(doc, f, sort_keys=False)
+        # Atomic write: every DP rank generates this identical file concurrently. Writing in
+        # place ("w" truncates to zero bytes first) leaves a microsecond window where a peer
+        # rank's energon loader reads an empty file -> yaml.safe_load returns None ->
+        # "'NoneType' object is not iterable". Write to a unique temp file then os.replace
+        # (atomic rename) so readers only ever see the complete old or new file, never empty.
+        text = yaml.safe_dump(doc, sort_keys=False)
+        fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=f".euro_vl_blend_{digest}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(tmp, out_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         return out_path
 
     def build_datasets(self, context):
         """Generate the repeat-factor blend metadataset, point ``path`` at it, then defer to base."""
+        # Gate energon fill-to-seq_length packing on the explicit toggle. When on, ensure a
+        # buffer size is set (default 256); when off, disable packing so the base provider
+        # skips the MBS==1 assert and trains on unpacked (padded) sequences.
+        if self.pack_to_seq_length:
+            if self.packing_buffer_size is None:
+                self.packing_buffer_size = 256
+        else:
+            self.packing_buffer_size = None
+
         blend = self._resolve_blend(self._discover_datasets())
         total = sum(eff for *_, eff in blend)
         self.path = self._write_metadataset(blend)
@@ -200,11 +230,33 @@ class EuroVLEnergonProvider(EnergonProvider):
             f"  r={r:g}  size={size:,}  eff={eff:,.0f}  step%={100 * eff / total:5.1f}  {os.path.basename(p)}"
             for p, r, size, eff in blend
         ]
+
+        # Aggregate samples / effective-samples / step-share by category (the dataset's parent
+        # path relative to root, e.g. "image/captioning", "image/ocr").
+        root_abs = os.path.abspath(self.root)
+        cat: dict[str, list[float]] = {}  # category -> [raw_size, eff, n_datasets]
+        for p, _, size, eff in blend:
+            category = os.path.dirname(os.path.relpath(p, root_abs)) or "."
+            agg = cat.setdefault(category, [0.0, 0.0, 0.0])
+            agg[0] += size
+            agg[1] += eff
+            agg[2] += 1
+        total_size = sum(size for _, _, size, _ in blend)
+        cat_lines = [
+            f"  {c}: {int(n)} dataset(s)  size={int(s):,} ({100 * s / total_size:4.1f}% of data)"
+            f"  eff={e:,.0f}  step%={100 * e / total:5.1f}"
+            for c, (s, e, n) in sorted(cat.items())
+        ]
+
         logger.info(
-            "EuroVL blend (InternVL repeat factors): %d dataset(s), total_eff=%.0f -> %s\n%s",
+            "EuroVL blend (InternVL repeat factors): %d dataset(s) in %d categor(ies), "
+            "total_samples=%d, total_eff=%.0f -> %s\nBy dataset:\n%s\nBy category:\n%s",
             len(blend),
+            len(cat),
+            int(total_size),
             total,
             self.path,
             "\n".join(lines),
+            "\n".join(cat_lines),
         )
         return super().build_datasets(context)

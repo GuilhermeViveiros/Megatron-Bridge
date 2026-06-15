@@ -46,9 +46,7 @@ _SCRATCH = os.environ["SCRATCH"]
 EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_hf"
 # Root of the prepared Energon datasets (energon-data/). Static default; override per
 # launch with dataset.root=... or the EUROVL_ENERGON_ROOT env var.
-EUROVL_ENERGON_ROOT = os.environ.get(
-    "EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data"
-)
+EUROVL_ENERGON_ROOT = os.environ.get("EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data")
 
 
 def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
@@ -63,12 +61,15 @@ def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
         # vocab_size extended: 128000 (EuroLLM) + 5 vision special tokens (128000-128004)
         vocab_size=128005,
         make_vocab_size_divisible_by=128,
+        # Pad the (odd) 128005 vocab up to a TP-divisible size; required for TP>1
+        # (VocabParallelEmbedding splits vocab across TP ranks). Harmless at TP=1.
+        should_pad_vocab=True,
         seq_length=4096,
         # Llama / EuroLLM settings
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
         position_embedding_type="rope",
-        rotary_base=10000,
+        rotary_base=1000000,  # EuroLLM-1.7B rope_theta (NOT 10000); must match the base model
         rotary_percent=1.0,
         gated_linear_unit=True,
         hidden_dropout=0.0,
@@ -104,7 +105,7 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
         model.freeze_language_model=True model.freeze_vision_model=True
     """
     cfg = _sft_common_vlm()
-    
+
     # Model configuration
     cfg.model = _make_euro_vl_2b_provider()
 
@@ -119,9 +120,9 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
     cfg.model.freeze_vision_model = False
     cfg.model.freeze_vision_projection = False
 
-    #cfg.train.train_iters = 50000
-    #cfg.train.global_batch_size = 32
-    #cfg.train.micro_batch_size = 1
+    # cfg.train.train_iters = 50000
+    # cfg.train.global_batch_size = 32
+    # cfg.train.micro_batch_size = 1
 
     # TE / Transformer implementation
     cfg.model.transformer_impl = "transformer_engine"
@@ -133,8 +134,8 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
 
     # Training config
     cfg.train.train_iters = 500
-    cfg.train.global_batch_size = 126
-    cfg.train.micro_batch_size = 6
+    cfg.train.global_batch_size = 128
+    cfg.train.micro_batch_size = 1
 
     # Validation config
     cfg.validation.eval_interval = 500
@@ -218,8 +219,19 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
           cc12m: 0.3
           sharegpt4o: 2.0
 
-    ``epochs`` (default 1) auto-derives ``train_iters = ceil(epochs * Σ(r*size) / GBS)``,
-    so you don't hand-set steps. The provider logs each dataset's r / size / step-share.
+    The provider logs each dataset's r / size / step-share.
+
+    Sequence packing: ``packing_buffer_size`` enables energon fill-to-``seq_length`` packing
+    (InternVL / Nemotron-Nano-V2 style) — each training sequence packs ~``seq_length`` /
+    avg-sample-length samples via THD/varlen attention, decoupled from ``micro_batch_size``.
+    This requires ``train.micro_batch_size=1`` (THD/CP) and is mutually exclusive with
+    ``pack_sequences_in_batch``; the provider asserts both. Launch example::
+
+        train.micro_batch_size=1 train.global_batch_size=128 train.train_iters=10000
+
+    ``train_iters`` is **not** auto-derived under packing — set it explicitly at launch
+    (a sample-count → step estimate is ill-defined once packing collapses many samples
+    per step). A packing-aware estimate is a tracked follow-up.
 
     Energon imports are local so the other EuroVL recipes do not require
     ``megatron-energon`` to be installed.
@@ -229,20 +241,35 @@ def euro_vl_2b_sft_energon_config() -> ConfigContainer:
 
     cfg = euro_vl_2b_sft_config()
 
+    # Long context for the energon stage. Set before building the task encoder / provider
+    # below so seq_length propagates to both (they read cfg.model.seq_length at build).
+    cfg.model.seq_length = 8192
+    # 12288
+    # 8192
+    # 16384
+
+    # Square-root per-token loss (InternVL3.5 eq. 2): the task encoder bakes a 1/sqrt(N)
+    # weight into each sample's loss_mask, and calculate_per_token_loss=True makes Megatron
+    # normalize by the global sum of weights. Both must be set together.
+    cfg.model.calculate_per_token_loss = True
+
     processor = EuroVLProcessor.from_pretrained(EUROVL_HF)
     task_encoder = EuroVLTaskEncoder(
         processor=processor,
         seq_length=cfg.model.seq_length,
+        sqrt_loss_weighting=True,
     )
     cfg.dataset = EuroVLEnergonProvider(
         root=EUROVL_ENERGON_ROOT,
         mixture_file=os.path.join(EUROVL_ENERGON_ROOT, "mixture.yaml"),
-        epochs=1.0,  # train_iters auto-computed = ceil(epochs * Σ(r*size) / GBS); set dataset.epochs
         seq_length=cfg.model.seq_length,
         micro_batch_size=cfg.train.micro_batch_size,
         global_batch_size=cfg.train.global_batch_size,
         num_workers=8,
         task_encoder=task_encoder,
+        # Energon fill-to-seq_length packing (requires train.micro_batch_size=1).
+        # Mutually exclusive with pack_sequences_in_batch.
+        packing_buffer_size=256,
         pack_sequences_in_batch=False,
     )
     return cfg

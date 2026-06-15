@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
@@ -81,7 +80,10 @@ class EuroVLModel(MegatronModule):
 
         if pre_process:
             # Build the vendored MoonViT vision tower from the in-repo config object
-            # (no AutoConfig/AutoModel, no trust_remote_code).
+            # (no AutoConfig/AutoModel, no trust_remote_code). Force flash-attn varlen
+            # (cu_seqlens, O(N) per image) — HF otherwise auto-selects the sdpa path, which
+            # materializes a dense [N, N] patch mask (O(N^2)) and OOMs at long packed lengths.
+            config.vision_config._attn_implementation = "flash_attention_2"
             self.vision_tower = MoonVitPretrainedModel(config.vision_config).to(config.params_dtype)
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
 
@@ -136,20 +138,18 @@ class EuroVLModel(MegatronModule):
         if not self.pre_process:
             return None
         batch_size, seq_len = input_ids.shape
-        causal_mask = torch.tril(
-            torch.ones((batch_size, 1, seq_len, seq_len), device=input_ids.device)
-        )
+        causal_mask = torch.tril(torch.ones((batch_size, 1, seq_len, seq_len), device=input_ids.device))
 
         # Assign a unique block index to every token inside a vision block
         # (<|vision_start|>, <image>*N, <|vision_end|>).  Tokens outside any
         # vision block get block_idx=0 and are excluded from bidirectional attention.
-        vision_start = (input_ids == self.config.vision_start_token_id)
-        vision_end   = (input_ids == self.config.vision_end_token_id)
+        vision_start = input_ids == self.config.vision_start_token_id
+        vision_end = input_ids == self.config.vision_end_token_id
         # Cumulative count of opened blocks minus closed blocks gives in-block flag.
         opened = torch.cumsum(vision_start, dim=-1)
-        closed = torch.cumsum(vision_end.roll(1, dims=-1).masked_fill(
-            torch.arange(seq_len, device=input_ids.device) == 0, False
-        ), dim=-1)
+        closed = torch.cumsum(
+            vision_end.roll(1, dims=-1).masked_fill(torch.arange(seq_len, device=input_ids.device) == 0, False), dim=-1
+        )
         in_block = (opened - closed) > 0
         # Use opened as block ID (unique per vision block).
         block_idx = opened * in_block  # 0 outside blocks, ≥1 inside
@@ -189,12 +189,12 @@ class EuroVLModel(MegatronModule):
         Returns:
             Tuple of (model_output, loss_mask) where loss_mask may be CP-sliced.
         """
-        #import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         if self.pre_process:
             if inputs_embeds is None:
                 inputs_embeds = self.language_model.embedding(
                     input_ids=input_ids, position_ids=None
-                ) # [decoder_seq_len, b, h_language]
+                )  # [decoder_seq_len, b, h_language]
 
                 inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
 

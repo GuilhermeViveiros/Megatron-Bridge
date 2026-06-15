@@ -384,9 +384,13 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
         # # Add packing metadata
         logger.debug(f"Packed batch: cu_seqlens={cu_seqlens.tolist()}, max_seqlen={max_seqlen}")
     else:
-        # No packing, use dummy values
-        cu_seqlens = None
-        max_seqlen = None
+        # Energon fill-to-seq_length packing (e.g. EuroVLTaskEncoder) supplies cu_seqlens
+        # directly on the batch: sequences arrive pre-packed as [1, seq_length] with their
+        # per-sub-sequence boundaries, so honor them and route through THD/varlen attention
+        # instead of recomputing. Batches without cu_seqlens (the common case) fall back to
+        # None (dense attention), so this is backward-compatible.
+        cu_seqlens = batch.get("cu_seqlens")
+        max_seqlen = batch.get("max_seqlen")
 
     return (
         (batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids")),

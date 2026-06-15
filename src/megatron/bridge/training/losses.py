@@ -99,7 +99,11 @@ def masked_next_token_loss(
             fatal=False,
         )
 
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    # Keep float (do not truncate to int): with fractional per-token loss weights
+    # (e.g. EuroVL sqrt loss) this is the sum of weights used as the global loss
+    # denominator, and truncating would bias normalization. For binary 0/1 masks the
+    # value is integer-valued, so this is identical to the previous behavior bar dtype.
+    num_tokens = loss_mask.sum().clone().detach()
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     return (loss, num_tokens, {"lm loss": reporting_loss})

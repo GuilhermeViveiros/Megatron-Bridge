@@ -190,6 +190,7 @@ def setup(
     cfg.model.vocab_size, cfg.model.should_pad_vocab = _validate_and_set_vocab_size(
         model_vocab_size=cfg.model.vocab_size,
         tokenizer_vocab_size=tokenizer.vocab_size,
+        should_pad_vocab=getattr(cfg.model, "should_pad_vocab", False),
     )
 
     cfg.dataset.tokenizer = tokenizer
@@ -533,12 +534,16 @@ def _apply_peft_transformation(peft, base_model: list[MegatronModule]) -> list[M
     return transformed_model
 
 
-def _validate_and_set_vocab_size(model_vocab_size: Optional[int], tokenizer_vocab_size: int) -> tuple[int, bool]:
+def _validate_and_set_vocab_size(
+    model_vocab_size: Optional[int], tokenizer_vocab_size: int, should_pad_vocab: bool = False
+) -> tuple[int, bool]:
     """Validate and determine the correct vocab size for the model.
 
     Args:
         model_vocab_size: Vocab size set in model config (can be None)
         tokenizer_vocab_size: Unpadded tokenizer vocab size
+        should_pad_vocab: The config's existing padding flag, honored when the model vocab size
+            is explicitly set (so a recipe can request TP-aligned padding of an exact vocab).
 
     Returns:
         tuple[int, bool]: The validated unpadded vocab size and padding flag
@@ -559,14 +564,15 @@ def _validate_and_set_vocab_size(model_vocab_size: Optional[int], tokenizer_voca
             f"({tokenizer_vocab_size})."
         )
     else:
-        # Model vocab size is explicitly set and is >= tokenizer vocab size
-        # Disable padding since this was explicitly set
+        # Model vocab size is explicitly set and is >= tokenizer vocab size. Keep it as the
+        # unpadded size, but honor the config's should_pad_vocab so a recipe can still request
+        # TP-aligned padding of an exact vocab (e.g. an odd 128005 that must divide TP).
         if model_vocab_size > tokenizer_vocab_size:
             logging.info(
                 f"Using preset vocab_size: {model_vocab_size} over the tokenizer vocab_size: {tokenizer_vocab_size}, dummy tokens:"
                 f" {model_vocab_size - tokenizer_vocab_size}."
             )
-        return model_vocab_size, False
+        return model_vocab_size, should_pad_vocab
 
 
 def maybe_log_and_save_config(cfg: ConfigContainer) -> None:
