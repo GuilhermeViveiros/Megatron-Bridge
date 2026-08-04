@@ -168,6 +168,8 @@ class EuroVLModel(MegatronModule):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional["PackedSeqParams"] = None,
@@ -183,6 +185,12 @@ class EuroVLModel(MegatronModule):
                 in patches). MoonViT is 2D-only so t=1; the temporal dim is stripped before the
                 vision tower. Kept in the codebase-wide ``image_grid_thw`` form for the shared
                 FLOPs counter.
+            pixel_values_videos: Packed video-frame patches for MoonViT, shape
+                [total_patches, C, H, W]. Frames are packed exactly like images.
+            video_grid_thw: Per-video grid dimensions, shape [num_videos, 3] (t, height, width),
+                where t = number of frames. MoonViT is per-frame 2D, so this is expanded to
+                per-frame (h, w) grids before the vision tower and scattered into
+                ``video_token_id`` positions.
             labels: Shifted token ids for cross-entropy loss.
             loss_mask: Boolean mask selecting positions that contribute to the loss.
 
@@ -215,6 +223,24 @@ class EuroVLModel(MegatronModule):
                 )
                 inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, projected)
 
+            if pixel_values_videos is not None and video_grid_thw is not None:
+                pixel_values_videos = pixel_values_videos.to(self._vision_dtype)
+                # video_grid_thw is [num_videos, (t, h, w)] with t = #frames. MoonViT is
+                # per-frame 2D and the video processor packs frames exactly like images, so
+                # expand to per-frame (h, w): t rows of (h, w) per video, in temporal order.
+                frame_hws = torch.repeat_interleave(video_grid_thw[:, 1:], video_grid_thw[:, 0], dim=0)
+                video_features = self.vision_tower(pixel_values_videos, frame_hws)
+                all_video_features = torch.cat(video_features, dim=0).flatten(1)
+                projected_videos = self.multi_modal_projector(all_video_features).to(inputs_embeds.dtype)
+
+                special_video_mask = (
+                    (input_ids == self.config.video_token_id)
+                    .unsqueeze(-1)
+                    .expand_as(inputs_embeds)
+                    .to(inputs_embeds.device)
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, projected_videos)
+
             inputs_embeds = inputs_embeds.transpose(0, 1).contiguous()
 
         if self.config.use_bidirectional_image_attention and input_ids is not None:
@@ -246,3 +272,73 @@ class EuroVLModel(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
         return outputs, loss_mask
+
+
+class Qwen3EuroVLModel(EuroVLModel):
+    """EuroVL vision path (MoonViT + projector) on a Qwen3-VL interleaved-M-RoPE LLM backbone.
+
+    Validation / oracle variant (see ``current.md``): reuses :class:`EuroVLModel`'s vision
+    integration and Qwen3-VL's proven interleaved-M-RoPE GPT (``Qwen3VLGPTModel``, built by
+    :meth:`Qwen3EuroVLModelProvider.provide_language_model`) as the language model. Only ``forward``
+    differs from :class:`EuroVLModel`: it computes 3D ``[3, B, S]`` ``(t, h, w)`` position ids via
+    :func:`get_rope_index` (resetting per packed sub-sequence) and feeds them to the M-RoPE LLM,
+    which a stock 1D ``GPTModel`` cannot consume. Deepstack is left off (``Qwen3VLGPTModel``
+    defaults ``deepstack_visual_embeds`` to ``None``).
+
+    TODO(P4): validate CP>1 with 3D position ids (``slice_batch_for_context_parallel`` currently
+    assumed CP=1).
+    """
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: Optional["PackedSeqParams"] = None,
+        *,
+        loss_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Compute 3D M-RoPE position ids, then run the shared EuroVL forward.
+
+        Overrides any 1D ``position_ids`` from the step: M-RoPE positions are derived from the
+        token stream + ``image_grid_thw`` / ``video_grid_thw`` (each video row's t frames are
+        laid out as per-frame blocks inside ``get_rope_index``), resetting per packed
+        sub-sequence (``cu_seqlens``).
+        """
+        from megatron.bridge.models.euro_vl.rope import get_rope_index
+
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None) if packed_seq_params is not None else None
+        # MoonViT spatial merge factor (merge_kernel_size=[2,2] -> 2).
+        merge_cfg = getattr(self.config.vision_config, "merge_kernel_size", 2)
+        spatial_merge_size = merge_cfg[0] if isinstance(merge_cfg, (list, tuple)) else merge_cfg
+        position_ids = get_rope_index(
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            cu_seqlens=cu_seqlens,
+            spatial_merge_size=spatial_merge_size,
+            image_token_id=self.config.image_token_id,
+            video_token_id=self.config.video_token_id,
+            vision_start_token_id=self.config.vision_start_token_id,
+        )
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            labels=labels,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask,
+        )

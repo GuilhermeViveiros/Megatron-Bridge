@@ -283,3 +283,18 @@ class EuroVLProcessor(ProcessorMixin):
     def decode(self, *args, **kwargs):
         """Delegate to the tokenizer's decode."""
         return self.tokenizer.decode(*args, **kwargs)
+
+
+class Qwen3EuroVLProcessor(EuroVLProcessor):
+    """EuroVL processor for the Qwen3-backbone variant (:class:`Qwen3EuroVLModel`).
+
+    Identical pipeline (MoonViT image/video processing + ChatML chat template); the only
+    difference is the vision placeholder strings: the Qwen3 tokenizer ships its own vision
+    tokens built into the base vocab (no vocab extension), so we use them directly —
+    ``<|image_pad|>`` (151655) / ``<|video_pad|>`` (151656) instead of EuroVL's appended
+    ``<image>`` / ``<video>``. ``<|vision_start|>`` / ``<|vision_end|>`` already match.
+    These are the exact ids Qwen3-VL uses, keeping the oracle faithful.
+    """
+
+    image_token = "<|image_pad|>"
+    video_token = "<|video_pad|>"

@@ -32,9 +32,11 @@ joint tokenization + MoonViT preprocessing and emits ``GenericVisualInputs`` wit
 import dataclasses
 import io
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+import numpy as np
 import torch
 from megatron.energon import Cooker, basic_sample_keys
 from megatron.energon.task_encoder.base import stateless
@@ -53,7 +55,19 @@ from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 # Crude-sample extensions to look for, in priority order.
 _IMAGE_EXTS = ("jpg", "jpeg", "png", "image")
+_VIDEO_EXTS = ("mp4", "webm", "mkv", "mov", "avi", "video")
 _CONVERSATION_EXTS = ("json", "conversation", "txt")
+
+# Multi-image samples (e.g. mi_grounding) store N images per key as separate WebDataset
+# parts named `img{i}.<ext>` (i = 0-based image order, matching the conversation's leading
+# `<image>` tokens positionally) instead of the single-image `jpg` part. See
+# to_energon.py's `--from-multi-image-raw` writer for the producing side.
+_MULTI_IMAGE_RE = re.compile(r"^img(\d+)\.(?:jpg|jpeg|png)$")
+
+# Multi-video samples store N videos per key as separate WebDataset parts named
+# `vid{i}.<ext>` (0-based video order, matching the conversation's leading `<video>` tokens),
+# mirroring the multi-image `img{i}` layout. A single-video sample uses a bare `mp4` part.
+_MULTI_VIDEO_RE = re.compile(r"^vid(\d+)\.(?:mp4|webm|mkv|mov|avi)$")
 
 
 @dataclass
@@ -97,13 +111,19 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         seq_length: Maximum sequence length (tokens truncated to this).
     """
 
-    def __init__(self, processor, seq_length: int = 4096, sqrt_loss_weighting: bool = False) -> None:
-        # EuroVLProcessor returns pixel_values + image_grid_thw (3D, t=1); capture both
-        # so GenericVisualInputs forwards them to EuroVLModel and the FLOP counter sees the grid.
+    def __init__(
+        self,
+        processor,
+        seq_length: int = 4096,
+        sqrt_loss_weighting: bool = False,
+    ) -> None:
+        # EuroVLProcessor returns pixel_values + image_grid_thw for images and
+        # pixel_values_videos + video_grid_thw for videos; capture all four so
+        # GenericVisualInputs forwards them to EuroVLModel and the FLOP counter sees the grids.
         super().__init__(
             processor=processor,
             seq_length=seq_length,
-            visual_keys=("pixel_values", "image_grid_thw"),
+            visual_keys=("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"),
         )
         # Square-root per-token loss reweighting (InternVL3.5 eq. 2). When True, each
         # supervised token's loss_mask weight is 1/sqrt(N) (N = supervised tokens in the
@@ -116,21 +136,169 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         # method is picklable (the encoder itself is sent to dataloader workers).
         self.cookers = [Cooker(cook=self._cook)]
 
+    @property
+    def _video_num_frames(self) -> int:
+        """Frames to sample per video — the single source of truth is the processor's video
+        processor (``num_frames``), which the processor itself re-samples to; reading it here
+        keeps decode and processor in lockstep. Raises if the processor is not configured for
+        video (no ``video_processor.num_frames``), since a video sample then cannot be encoded.
+        """
+        vp = getattr(self.processor, "video_processor", None)
+        n = getattr(vp, "num_frames", None) if vp is not None else None
+        if n is None:
+            raise ValueError(
+                "A video sample was encountered but the processor is not configured for video "
+                "(no video_processor.num_frames). Build the processor with num_frames set."
+            )
+        return int(n)
+
+    def _sample_frame_indices(self, total: int) -> list[int]:
+        """``_video_num_frames`` uniformly-spaced frame indices in ``[0, total)`` (sorted, deduped).
+
+        Same ``np.linspace`` idiom as ``MoonViTVideoProcessor._sample_frames`` — feeding the
+        processor exactly ``n`` frames is then an identity re-sample.
+        """
+        n = self._video_num_frames
+        if n >= total:
+            return list(range(total))
+        return sorted(set(np.linspace(0, total - 1, n).round().astype(int).tolist()))
+
+    @staticmethod
+    def _frame_to_pil(f) -> Image.Image:
+        """Coerce a single decoded frame (PIL, or ``[C,H,W]``/``[H,W,C]`` uint8 tensor/array) to PIL RGB."""
+        if isinstance(f, Image.Image):
+            return f.convert("RGB")
+        if isinstance(f, torch.Tensor):
+            # energon VideoData frames are [C,H,W]; torchvision are [H,W,C]. fromarray wants HWC.
+            if f.ndim == 3 and f.shape[0] in (1, 3) and f.shape[-1] not in (1, 3):
+                f = f.permute(1, 2, 0)
+            f = f.cpu().numpy()
+        else:
+            f = np.asarray(f)
+        return Image.fromarray(f).convert("RGB")
+
+    def _frames_from_video(self, v) -> list[Image.Image]:
+        """Sample ``_video_num_frames`` PIL frames from whatever form the crude sample carries.
+
+        Energon auto-decodes ``.mp4`` into ``megatron.energon.av.video_data.VideoData`` whose
+        ``.frames`` is a ``[T, C, H, W]`` uint8 tensor, so most video items arrive already
+        decoded; raw bytes (auto-decode off) go through the memory-bounded PyAV path instead.
+        Also handles a torchvision ``(vframes[T,H,W,C], …)`` tuple, a bare frame tensor, or a
+        list of per-frame PIL/tensor images.
+        """
+        if isinstance(v, (bytes, bytearray)):
+            return self._decode_video_bytes(v)
+        # energon VideoData -> .frames [T,C,H,W]; torchvision -> .vframes / tuple[0] [T,H,W,C].
+        frames = getattr(v, "frames", None)
+        if frames is None:
+            frames = getattr(v, "vframes", None)
+        if frames is None:
+            frames = v[0] if isinstance(v, (tuple, list)) and len(v) > 0 and isinstance(v[0], torch.Tensor) else v
+        if isinstance(frames, torch.Tensor):
+            total = int(frames.shape[0])
+            if total == 0:
+                raise ValueError("decoded video has 0 frames")
+            return [self._frame_to_pil(frames[i]) for i in self._sample_frame_indices(total)]
+        if isinstance(frames, (list, tuple)):
+            total = len(frames)
+            if total == 0:
+                raise ValueError("decoded video has 0 frames")
+            return [self._frame_to_pil(frames[i]) for i in self._sample_frame_indices(total)]
+        raise TypeError(f"unsupported video item type {type(v)} (frames {type(frames)})")
+
+    def _decode_video_bytes(self, video_bytes: bytes) -> list[Image.Image]:
+        """Decode ``_video_num_frames`` uniformly-sampled PIL frames (PyAV), memory-bounded.
+
+        Only the sampled frames are ever materialized — the whole clip is NOT loaded into
+        memory (a multi-minute clip is thousands of frames and would OOM the dataloader
+        worker, ×num_workers). Used when video arrives as raw bytes (energon video auto-decode
+        off); with auto-decode on, :meth:`_frames_from_video` handles the decoded tensor.
+        """
+        import av
+
+        # 1. Total frame count, cheaply: container metadata, else estimate from duration × rate,
+        #    else a decode-and-discard counting pass (O(1) memory — frames are not retained).
+        with av.open(io.BytesIO(video_bytes)) as container:
+            stream = container.streams.video[0]
+            total = int(stream.frames or 0)
+            if total <= 0 and stream.duration is not None and stream.average_rate:
+                total = int(float(stream.duration * stream.time_base) * float(stream.average_rate))
+        if total <= 0:
+            with av.open(io.BytesIO(video_bytes)) as container:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                total = sum(1 for _ in container.decode(stream))
+        if total <= 0:
+            raise ValueError("no frames decoded from video bytes")
+
+        # 2. Uniformly-spaced target indices (shared sampler).
+        targets = set(self._sample_frame_indices(total))
+
+        # 3. Single decode pass, keeping ONLY the target frames (peak memory O(n)).
+        frames: list[Image.Image] = []
+        with av.open(io.BytesIO(video_bytes)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            for i, frame in enumerate(container.decode(stream)):
+                if i in targets:
+                    frames.append(frame.to_image().convert("RGB"))
+                    if len(frames) >= len(targets):
+                        break
+        if not frames:
+            raise ValueError("no frames decoded from video bytes")
+        return frames
+
     def _cook(self, sample: dict) -> ChatMLSample:
-        """Decode a crude sample (``jpg`` + ``json`` conversation) into a :class:`ChatMLSample`.
+        """Decode a crude sample (``jpg``/``mp4`` + ``json`` conversation) into a :class:`ChatMLSample`.
 
         Energon's webdataset decoder already turns ``jpg`` into a CHW tensor and ``json``
         into a parsed object, so we pass those through: ``HFEncoderVLMTaskEncoder``
-        converts the image tensor to PIL (``_images_to_pil``) and ``cook_chatml_sample``
-        parses the conversation. Raw-bytes inputs are handled too, in case a different
-        energon decode config is used.
+        converts image/video tensors to PIL (``_images_to_pil`` / ``_videos_to_pil``) and
+        ``cook_chatml_sample`` parses the conversation. Raw-bytes inputs are handled too, in
+        case a different energon decode config is used. A sample may carry images, videos, or
+        both (at least one is required); images/videos line up positionally with the
+        conversation's leading ``<image>`` / ``<video>`` tokens.
         """
-        raw_img = _crude_get(sample, _IMAGE_EXTS)
-        if raw_img is None:
-            raise KeyError(f"crude sample has no image (looked for {_IMAGE_EXTS}); keys={list(sample.keys())}")
-        # tensor / PIL -> pass through (converted to PIL downstream); bytes -> decode here.
-        if isinstance(raw_img, (bytes, bytearray)):
-            raw_img = Image.open(io.BytesIO(raw_img)).convert("RGB")
+        # Multi-image sample: one or more `img{i}.<ext>` parts, sorted by index so they line
+        # up positionally with the conversation's leading `<image>` tokens. Falls through to
+        # the single-image `jpg` lookup below when none are present (every other dataset).
+        multi_image_matches = sorted(
+            ((int(m.group(1)), k) for k in sample if (m := _MULTI_IMAGE_RE.match(k))),
+            key=lambda pair: pair[0],
+        )
+        imgs: Optional[list] = None
+        if multi_image_matches:
+            imgs = [sample[k] for _, k in multi_image_matches]
+            imgs = [Image.open(io.BytesIO(im)).convert("RGB") if isinstance(im, (bytes, bytearray)) else im for im in imgs]
+        else:
+            raw_img = _crude_get(sample, _IMAGE_EXTS)
+            if raw_img is not None:
+                # tensor / PIL -> pass through (converted to PIL downstream); bytes -> decode here.
+                if isinstance(raw_img, (bytes, bytearray)):
+                    raw_img = Image.open(io.BytesIO(raw_img)).convert("RGB")
+                imgs = [raw_img]
+
+        # Multi-video sample: `vid{i}.<ext>` parts (positional with `<video>` tokens); else a
+        # single bare `mp4` part. Each is decoded to a list of frames; None when no video part.
+        multi_video_matches = sorted(
+            ((int(m.group(1)), k) for k in sample if (m := _MULTI_VIDEO_RE.match(k))),
+            key=lambda pair: pair[0],
+        )
+        videos: Optional[list] = None
+        raw_videos = [sample[k] for _, k in multi_video_matches] if multi_video_matches else None
+        if raw_videos is None:
+            single = _crude_get(sample, _VIDEO_EXTS)
+            raw_videos = [single] if single is not None else None
+        if raw_videos is not None:
+            # Normalize each video to a list of sampled PIL frames, regardless of whether energon
+            # auto-decoded it (torchvision tensor) or left it as raw bytes.
+            videos = [self._frames_from_video(v) for v in raw_videos]
+
+        if imgs is None and videos is None:
+            raise KeyError(
+                f"crude sample has no image or video (looked for {_IMAGE_EXTS} / {_VIDEO_EXTS}); "
+                f"keys={list(sample.keys())}"
+            )
 
         raw_conv = _crude_get(sample, _CONVERSATION_EXTS)
         if raw_conv is None:
@@ -146,7 +314,8 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         return ChatMLSample(
             **basic_sample_keys(sample),
             conversation=raw_conv,
-            imgs=[raw_img],
+            imgs=imgs,
+            videos=videos,
         )
 
         # ------------------------------------------------------------------

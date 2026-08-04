@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from torch import int_repr
@@ -41,6 +41,8 @@ class EnergonProvider(DatasetProvider):
     packing_buffer_size: Optional[int] = None
     # Max samples loaded from a tar shard at once (energon); None loads the whole shard.
     max_samples_per_sequence: Optional[int] = None
+    # Empty by default -> no behavior change. Used e.g. to set ``auto_decode=False``
+    energon_dataset_kwargs: dict = field(default_factory=dict)
 
     def build_datasets(self, context: DatasetBuildContext):
         assert self.path, "EnergonProvider.path must be set. Use CLI override: dataset.path=<path>"
@@ -74,6 +76,7 @@ class EnergonProvider(DatasetProvider):
             packing_buffer_size=self.packing_buffer_size,
             max_samples_per_sequence=self.max_samples_per_sequence,
             pg_collection=context.pg_collection,
+            **self.energon_dataset_kwargs,
         )
         return (
             iter(dataset.train_dataloader()),

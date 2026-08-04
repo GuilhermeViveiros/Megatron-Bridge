@@ -124,6 +124,16 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
             return self._tokenizer.convert_tokens_to_ids(image_token)
         return None
 
+    @property
+    def _video_token_id(self) -> Optional[int]:
+        """Resolve video token ID from the processor, or ``None`` if unavailable."""
+        if hasattr(self.processor, "video_token_id"):
+            return self.processor.video_token_id
+        video_token = getattr(self.processor, "video_token", None)
+        if video_token is not None:
+            return self._tokenizer.convert_tokens_to_ids(video_token)
+        return None
+
     @staticmethod
     def _find_contiguous_blocks(arr: np.ndarray, value: int) -> List[Tuple[int, int]]:
         """Return ``[(start, end), ...]`` for each contiguous run of *value* in *arr*."""
@@ -162,21 +172,28 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         # 2. Normalize conversation
         conversation = cook_chatml_sample(sample.conversation)
 
-        # 2b. Convert <image> placeholders to structured multimodal content
-        #     so that apply_chat_template inserts model-specific image tokens.
+        # 2b. Convert <image>/<video> placeholders to structured multimodal content so that
+        #     apply_chat_template inserts the model-specific vision tokens. Both are handled in a
+        #     single ordered split so a turn may interleave images and videos.
         has_images = images_pil is not None
-        if has_images:
+        has_videos = videos_pil is not None
+        if has_images or has_videos:
             for turn in conversation:
                 text = turn["content"]
-                if "<image>" in text:
-                    parts = re.split(r"(<image>)", text)
-                    content_parts: list = []
-                    for part in parts:
-                        if part == "<image>":
-                            content_parts.append({"type": "image"})
-                        elif part.strip():
-                            content_parts.append({"type": "text", "text": part.strip()})
-                    turn["content"] = content_parts
+                if not isinstance(text, str):
+                    continue  # already structured content
+                if not (("<image>" in text and has_images) or ("<video>" in text and has_videos)):
+                    continue
+                parts = re.split(r"(<image>|<video>)", text)
+                content_parts: list = []
+                for part in parts:
+                    if part == "<image>" and has_images:
+                        content_parts.append({"type": "image"})
+                    elif part == "<video>" and has_videos:
+                        content_parts.append({"type": "video"})
+                    elif part.strip():
+                        content_parts.append({"type": "text", "text": part.strip()})
+                turn["content"] = content_parts
 
         # 3. Get the full prompt text from chat template (not tokenized)
         # Use processor (not tokenizer) because conversation may contain

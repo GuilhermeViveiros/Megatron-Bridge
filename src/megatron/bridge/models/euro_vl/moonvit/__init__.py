@@ -24,9 +24,32 @@ from megatron.bridge.models.euro_vl.moonvit.modeling_moonvit import MoonVitPretr
 from megatron.bridge.models.euro_vl.moonvit.video_processing_moonvit import MoonViTVideoProcessor
 
 
+class MoonViTVisionProcessor(MoonViTVideoProcessor, MoonViTImageProcessor):
+    """Unified MoonViT vision processor handling both images and videos.
+
+    Combines the image pipeline (:class:`MoonViTImageProcessor`, via ``__call__`` ->
+    ``pixel_values`` + ``image_grid_hws``) and the per-frame video pipeline
+    (:class:`MoonViTVideoProcessor`, via ``preprocess_videos`` -> ``pixel_values_videos`` +
+    ``video_grid_thw``), so a single instance drives both modalities. The
+    :attr:`image_processor` / :attr:`video_processor` views (both ``self``) let a single
+    instance be handed to consumers that expect the two separate sub-processors.
+    """
+
+    @property
+    def image_processor(self) -> "MoonViTImageProcessor":
+        """This instance viewed as its image processor (it subclasses MoonViTImageProcessor)."""
+        return self
+
+    @property
+    def video_processor(self) -> "MoonViTVideoProcessor":
+        """This instance viewed as its video processor (it subclasses MoonViTVideoProcessor)."""
+        return self
+
+
 __all__ = [
     "MoonViTConfig",
     "MoonViTImageProcessor",
     "MoonViTVideoProcessor",
+    "MoonViTVisionProcessor",
     "MoonVitPretrainedModel",
 ]

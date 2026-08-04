@@ -159,6 +159,15 @@ def get_rope_index(
     Returns:
         Long tensor ``[3, B, S]`` of ``(t, h, w)`` positions; pad slots are 0.
     """
+    # Qwen3-VL timestamp video: a [t, h, w] video grid row describes t frames, but each frame
+    # is its OWN vision block in the token stream (each with a timestamp text prefix). Split
+    # every row into t per-frame [1, h, w] rows so each block has llm_grid_t == 1 -> the t-axis
+    # index is always 0; temporal ordering is carried by the timestamp text advancing the base.
+    # Idempotent on t == 1 rows (images, or already-per-frame video), so it is always safe.
+    if video_grid_thw is not None and video_grid_thw.numel() > 0:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
     B, S = input_ids.shape
     position_ids = torch.zeros(3, B, S, dtype=torch.long, device=input_ids.device)
     img_idx = vid_idx = 0

@@ -1,6 +1,7 @@
 # VLM Bridge Patterns
 
 Reference implementations:
+
 - **Megatron vision encoder:** Qwen3.5-VL (`src/megatron/bridge/models/qwen_vl/`)
 - **HF vision encoder:** Gemma3-VL (`src/megatron/bridge/models/gemma_vl/`)
 
@@ -49,15 +50,17 @@ class MyVLModelProvider(GPTModelProvider):
 
 Read these from the correct config level:
 
-| Field | Source (VLM) | Notes |
-|-------|-------------|-------|
-| `num_layers`, `hidden_size`, `ffn_hidden_size` | `text_config` | Core architecture |
-| `num_attention_heads`, `num_key_value_heads` | `text_config` | Attention config |
-| `vocab_size`, `max_position_embeddings` | `text_config` | Tokenizer/position |
-| `rope_theta` | `text_config` | RoPE |
-| `tie_word_embeddings` | **top-level** `hf_config` | CRITICAL: not text_config |
-| `vision_config` | **top-level** `hf_config` | Vision encoder config |
-| `image_token_id`, `video_token_id` | **top-level** `hf_config` | Special token IDs |
+
+| Field                                          | Source (VLM)              | Notes                     |
+| ---------------------------------------------- | ------------------------- | ------------------------- |
+| `num_layers`, `hidden_size`, `ffn_hidden_size` | `text_config`             | Core architecture         |
+| `num_attention_heads`, `num_key_value_heads`   | `text_config`             | Attention config          |
+| `vocab_size`, `max_position_embeddings`        | `text_config`             | Tokenizer/position        |
+| `rope_theta`                                   | `text_config`             | RoPE                      |
+| `tie_word_embeddings`                          | **top-level** `hf_config` | CRITICAL: not text_config |
+| `vision_config`                                | **top-level** `hf_config` | Vision encoder config     |
+| `image_token_id`, `video_token_id`             | **top-level** `hf_config` | Special token IDs         |
+
 
 ## Bridge Pattern
 
@@ -175,23 +178,28 @@ class MyVLModel(MegatronModule):
 
 VLM weight names typically have these prefixes:
 
-| Megatron prefix | HF prefix | Component |
-|----------------|-----------|-----------|
-| `language_model.*` | `model.language_model.*` or `model.layers.*` | Text decoder |
-| `language_model.embedding.*` | `model.embed_tokens.*` | Text embeddings |
-| `language_model.output_layer.*` | `model.lm_head.*` or `lm_head.*` | Output head |
-| `vision_model.*` | `model.visual.*` or `vision_tower.*` | Vision encoder |
+
+| Megatron prefix                 | HF prefix                                    | Component       |
+| ------------------------------- | -------------------------------------------- | --------------- |
+| `language_model.*`              | `model.language_model.*` or `model.layers.*` | Text decoder    |
+| `language_model.embedding.*`    | `model.embed_tokens.*`                       | Text embeddings |
+| `language_model.output_layer.*` | `model.lm_head.*` or `lm_head.*`             | Output head     |
+| `vision_model.*`                | `model.visual.*` or `vision_tower.*`         | Vision encoder  |
+
 
 Check the actual HF model's `state_dict()` keys to determine exact naming.
 
 ## Common Mapping Types for VLMs
 
-| Mapping Class | Use Case |
-|--------------|----------|
-| `AutoMapping` | 1:1 name mapping (most weights) |
-| `QKVMapping` | Fused Q/K/V projections |
-| `ConcatenatedQKVMapping` | Vision QKV (different from language) |
-| `GatedMLPMapping` | gate_proj + up_proj → linear_fc1 |
-| `ReplicatedMapping` | Weights replicated across TP ranks (e.g. patch_embed) |
-| `ExpertMLPGateUpProjMapping` | MoE gate+up projections |
-| `ExpertMLPDownProjMapping` | MoE down projections |
+
+| Mapping Class                | Use Case                                              |
+| ---------------------------- | ----------------------------------------------------- |
+| `AutoMapping`                | 1:1 name mapping (most weights)                       |
+| `QKVMapping`                 | Fused Q/K/V projections                               |
+| `ConcatenatedQKVMapping`     | Vision QKV (different from language)                  |
+| `GatedMLPMapping`            | gate_proj + up_proj → linear_fc1                      |
+| `ReplicatedMapping`          | Weights replicated across TP ranks (e.g. patch_embed) |
+| `ExpertMLPGateUpProjMapping` | MoE gate+up projections                               |
+| `ExpertMLPDownProjMapping`   | MoE down projections                                  |
+
+

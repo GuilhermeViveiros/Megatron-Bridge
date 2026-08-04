@@ -52,7 +52,9 @@ falls back to using every discovered dataset at ``r=1`` (one epoch each)::
 
 import hashlib
 import logging
+import math
 import os
+import re
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -64,6 +66,10 @@ from megatron.bridge.data.energon.energon_provider import EnergonProvider
 
 
 logger = logging.getLogger(__name__)
+
+# ANSI colour for the blend/train-samples summary so it stands out in the launch log.
+_BLUE = "\033[94m"
+_RESET = "\033[0m"
 
 _MAX_REPEAT_FACTOR = 4.0  # InternVL uses r in (0, 4]; we also allow r=0 to exclude.
 
@@ -84,29 +90,88 @@ class EuroVLEnergonProvider(EnergonProvider):
     metadataset_dir: Optional[str] = None
 
     def _discover_datasets(self) -> dict[str, str]:
-        """Map dataset name (leaf dir) -> absolute path, for every prepared dataset under root."""
+        """Map dataset name -> absolute path, for every prepared dataset (``.nv-meta``) under root.
+
+        Datasets are keyed by their leaf dir name. When the SAME leaf name appears under two
+        different paths (e.g. ``image/gui/leopard_mind2web`` vs ``multiimage/gui/leopard_mind2web``,
+        or ``image/doc/sujet_finance`` vs ``image/ocr/sujet_finance``), the collision is
+        disambiguated by using the FULL relative path with separators replaced by ``_``
+        (``image_gui_leopard_mind2web``, ``image_doc_sujet_finance``, …) — unique by construction.
+        Unique leaf names are left bare, so existing mixtures keep matching by plain name; a
+        disambiguated dataset is targeted in the mixture by that prefixed name or by its relative
+        path (both handled in ``_resolve_repeat_factors``).
+        """
         if not self.root:
             raise ValueError("EuroVLEnergonProvider.root must be set (the energon-data directory).")
-        found: dict[str, str] = {}
-        for dirpath, dirnames, _ in os.walk(self.root):
-            if ".nv-meta" in dirnames:
-                name = os.path.basename(dirpath.rstrip("/"))
-                if name in found:
-                    raise ValueError(f"Duplicate dataset name {name!r} under {self.root}; names must be unique.")
-                found[name] = os.path.abspath(dirpath)
-        if not found:
+        root_abs = os.path.abspath(self.root)
+        paths = [
+            os.path.abspath(dirpath)
+            for dirpath, dirnames, _ in os.walk(self.root)
+            if ".nv-meta" in dirnames
+        ]
+        if not paths:
             raise ValueError(f"No prepared energon datasets (.nv-meta) found under {self.root}.")
+
+        leaf_counts: dict[str, int] = {}
+        for p in paths:
+            leaf = os.path.basename(p)
+            leaf_counts[leaf] = leaf_counts.get(leaf, 0) + 1
+
+        found: dict[str, str] = {}
+        for p in paths:
+            leaf = os.path.basename(p)
+            if leaf_counts[leaf] > 1:
+                # Full relative path (always unique) -> flatten to an underscore-joined name.
+                name = os.path.relpath(p, root_abs).replace(os.sep, "_")
+            else:
+                name = leaf
+            if name in found:
+                raise ValueError(
+                    f"Duplicate dataset key {name!r} under {self.root} even after path "
+                    f"disambiguation ({found[name]} vs {p}); rename one dataset directory."
+                )
+            found[name] = p
         return found
 
     @staticmethod
     def _dataset_size(path: str) -> int:
-        """Indexed sample count of a prepared energon dataset (from .nv-meta/index.sqlite)."""
-        idx = os.path.join(path, ".nv-meta", "index.sqlite")
+        """Number of **train-split** samples of a prepared energon dataset.
+
+        Counts rows in ``.nv-meta/index.sqlite`` whose shard is listed under
+        ``split_parts.train`` in ``split.yaml`` — i.e. the samples actually trained on (val/test
+        shards are excluded). Shard ``shard-00004.tar`` maps to ``tar_file_id`` by its numeric
+        index. Falls back to the full index count if ``split.yaml`` is missing or the
+        shard→id mapping is inconsistent (train+val+test != total), which is logged.
+        """
+        meta = os.path.join(path, ".nv-meta")
+        idx = os.path.join(meta, "index.sqlite")
         if not os.path.exists(idx):
             raise FileNotFoundError(f"{idx} not found — is {path} prepared (energon prepare)?")
         con = sqlite3.connect(f"file:{idx}?mode=ro", uri=True)
         try:
-            return int(con.execute("select count(*) from samples").fetchone()[0])
+            total = int(con.execute("select count(*) from samples").fetchone()[0])
+            split_path = os.path.join(meta, "split.yaml")
+            if not os.path.exists(split_path):
+                return total
+
+            def _count(shards) -> int:
+                ids = [int(m.group(1)) for s in (shards or []) if (m := re.search(r"(\d+)", os.path.basename(s)))]
+                if not ids:
+                    return 0
+                q = "select count(*) from samples where tar_file_id in (%s)" % ",".join("?" * len(ids))
+                return int(con.execute(q, ids).fetchone()[0])
+
+            parts = (yaml.safe_load(open(split_path)) or {}).get("split_parts", {}) or {}
+            train, val, test = _count(parts.get("train")), _count(parts.get("val")), _count(parts.get("test"))
+            if train <= 0 or train + val + test != total:
+                logger.warning(
+                    "Train-split count inconsistent for %s (train+val+test=%d != total=%d); using total.",
+                    os.path.basename(path),
+                    train + val + test,
+                    total,
+                )
+                return total
+            return train
         finally:
             con.close()
 
@@ -161,8 +226,7 @@ class EuroVLEnergonProvider(EnergonProvider):
             with open(self.mixture_file) as f:
                 for key, r in self._flatten_mixture_yaml(yaml.safe_load(f) or {}).items():
                     apply(key, r)
-            listed = {os.path.basename(p) for p in factors}
-            dropped = sorted(name for name in datasets if name not in listed)
+            dropped = sorted(name for name, p in datasets.items() if p not in factors)
             if dropped:
                 logger.info("Mixture excludes %d unlisted dataset(s): %s", len(dropped), ", ".join(dropped))
         else:
@@ -248,15 +312,35 @@ class EuroVLEnergonProvider(EnergonProvider):
             for c, (s, e, n) in sorted(cat.items())
         ]
 
-        logger.info(
-            "EuroVL blend (InternVL repeat factors): %d dataset(s) in %d categor(ies), "
-            "total_samples=%d, total_eff=%.0f -> %s\nBy dataset:\n%s\nBy category:\n%s",
-            len(blend),
-            len(cat),
-            int(total_size),
-            total,
-            self.path,
-            "\n".join(lines),
-            "\n".join(cat_lines),
-        )
+        # Worst-case (1 doc/pack) train_iters to cover the effective blend N times — a safe
+        # OVER-estimate under packing (packs hold ≥1 doc, so you finish sooner). Handy for
+        # sizing cfg.train.train_iters; energon does not auto-derive it (see module docstring).
+        gbs = self.global_batch_size
+        if gbs:
+            iters_line = (
+                f"Suggested train_iters (worst-case guaranteed pass, GBS={gbs}): "
+                f"1 epoch={math.ceil(total / gbs):,}  2 epochs={math.ceil(2 * total / gbs):,}  "
+                f"3 epochs={math.ceil(3 * total / gbs):,}"
+            )
+        else:
+            iters_line = "Suggested train_iters: global_batch_size unset — cannot estimate."
+
+        # Log the blend summary once (global rank 0) — every rank builds the blend, but the
+        # table is identical, so avoid N duplicate copies in the launch log.
+        if int(os.environ.get("RANK", "0")) == 0:
+            logger.info(
+                _BLUE
+                + "EuroVL blend (InternVL repeat factors): %d dataset(s) in %d categor(ies), "
+                "total_train_samples=%d, total_eff=%.0f -> %s\n%s\n"
+                "By dataset (size = TRAIN-split samples):\n%s\nBy category:\n%s"
+                + _RESET,
+                len(blend),
+                len(cat),
+                int(total_size),
+                total,
+                self.path,
+                iters_line,
+                "\n".join(lines),
+                "\n".join(cat_lines),
+            )
         return super().build_datasets(context)

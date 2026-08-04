@@ -15,6 +15,7 @@
 """EuroVL configuration — EuroLLM (Llama) language model + MoonViT vision encoder."""
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from megatron.bridge.models.euro_vl.moonvit.configuration_moonvit import MoonViTConfig
@@ -63,7 +64,7 @@ class EuroVLConfig(PretrainedConfig):
     """
 
     model_type = "euro_vl"
-    sub_configs = {"text_config": LlamaConfig, "vision_config": MoonViTConfig}
+    sub_configs = {"text_config": AutoConfig, "vision_config": MoonViTConfig}
 
     def __init__(
         self,
@@ -86,9 +87,16 @@ class EuroVLConfig(PretrainedConfig):
             vision_config = MoonViTConfig()
         self.vision_config = vision_config
 
-        # Text sub-config (dict -> object, or default EuroLLM-1.7B).
+        # Text sub-config (dict -> object, or default EuroLLM-1.7B). Dicts are resolved
+        # by their embedded ``model_type`` (standard HF composite-config pattern, cf.
+        # LlavaConfig): "llama" -> LlamaConfig (EuroLLM, default), "qwen3" -> Qwen3Config
+        # (the Qwen3EuroVL oracle backbone), etc. — so a saved checkpoint reloads with
+        # the correct backbone config class.
         if isinstance(text_config, dict):
-            text_config = LlamaConfig(**text_config)
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            text_model_type = text_config.get("model_type", "llama")
+            text_config = CONFIG_MAPPING[text_model_type](**text_config)
         elif text_config is None:
             text_config = LlamaConfig(**_EUROLLM_TEXT_DEFAULTS)
         self.text_config = text_config

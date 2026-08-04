@@ -33,9 +33,21 @@ from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
     QKVMapping,
+    ReplicatedMapping,
 )
+from transformers import AutoConfig, AutoModel
+
+from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
 from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel
+from megatron.bridge.models.euro_vl.modeling_euro_vl_hf import EuroVLForConditionalGeneration
+
+
+# Register the custom HF classes so AutoConfig/AutoModel can load assembled ``euro_vl``
+# checkpoints by model_type — required for the AutoBridge / pretrained_checkpoint path
+# (repo pattern: cf. stepfun / bailing bridges). Covers both backbones (EuroLLM & Qwen3).
+AutoConfig.register("euro_vl", EuroVLConfig, exist_ok=True)
+AutoModel.register(EuroVLConfig, EuroVLForConditionalGeneration, exist_ok=True)
 
 
 @MegatronModelBridge.register_bridge(
@@ -48,18 +60,32 @@ class EuroVLBridge(MegatronModelBridge):
     """Bridge converting an EuroVL HF checkpoint to the Megatron EuroVL model."""
 
     def provider_bridge(self, hf_pretrained) -> EuroVLModelProvider:
-        """Build EuroVLModelProvider from an EuroVL HF config.
+        """Build the right EuroVL provider from an EuroVL HF config.
 
         Reads LLM architecture from ``text_config`` and VLM-specific fields
         (vision_config, token ids, tie_word_embeddings) from the top-level config.
+        The backbone is dispatched on ``text_config.model_type`` (both backbones share
+        the ``euro_vl`` HF model_type, so one bridge serves both):
+
+          - ``"llama"`` (EuroLLM, default): :class:`EuroVLModelProvider`, 1D RoPE + fusion.
+          - ``"qwen3"`` (Qwen3EuroVL oracle): :class:`Qwen3EuroVLModelProvider` — its
+            subclass defaults carry the interleaved-M-RoPE config (``mrope`` position
+            embedding, ``mrope_section``, ``apply_rope_fusion=False``); plus Qwen3's
+            QK-norm (``qk_layernorm=True``).
         """
         hf_config = hf_pretrained.config
         text_config = hf_config.text_config
+        is_qwen3 = getattr(text_config, "model_type", "llama") == "qwen3"
 
         provider_kwargs = self.hf_config_to_provider_kwargs(text_config)
-        provider = EuroVLModelProvider(**provider_kwargs)
+        if is_qwen3:
+            from megatron.bridge.models.euro_vl.euro_vl_provider import Qwen3EuroVLModelProvider
 
-        # Llama / EuroLLM Megatron settings (mirror LlamaBridge).
+            provider = Qwen3EuroVLModelProvider(**provider_kwargs)
+        else:
+            provider = EuroVLModelProvider(**provider_kwargs)
+
+        # Megatron settings common to both backbones (Llama-style dense GQA decoders).
         provider.normalization = "RMSNorm"
         provider.gated_linear_unit = True
         provider.hidden_dropout = 0.0
@@ -67,11 +93,19 @@ class EuroVLBridge(MegatronModelBridge):
         provider.masked_softmax_fusion = True
         provider.persist_layer_norm = True
         provider.bias_dropout_fusion = True
-        provider.apply_rope_fusion = True
         provider.rotary_percent = 1.0
-        provider.position_embedding_type = "rope"
         provider.add_bias_linear = False
         provider.add_qkv_bias = False
+
+        if is_qwen3:
+            # QK-norm per attention head (q_norm/k_norm weights). RoPE settings are NOT
+            # touched here — the Qwen3EuroVLModelProvider defaults (mrope, no fusion,
+            # mrope_section) must survive.
+            provider.qk_layernorm = True
+        else:
+            # EuroLLM: standard 1D RoPE with the fused kernel.
+            provider.apply_rope_fusion = True
+            provider.position_embedding_type = "rope"
 
         # tie_word_embeddings lives on the TOP-LEVEL config (EuroLLM is untied).
         provider.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
@@ -114,6 +148,18 @@ class EuroVLBridge(MegatronModelBridge):
             "language_model.decoder.layers.*.self_attention.linear_proj.weight": "language_model.model.layers.*.self_attn.o_proj.weight",
             "language_model.decoder.layers.*.mlp.linear_fc2.weight": "language_model.model.layers.*.mlp.down_proj.weight",
         }
+
+        # Qwen3 backbone (Qwen3EuroVL oracle): per-head QK-norm weights, absent on Llama.
+        # self.hf_config is set by the dispatch system before mapping_registry is called.
+        hf_config = getattr(self, "hf_config", None)
+        text_model_type = getattr(getattr(hf_config, "text_config", None), "model_type", "llama")
+        if text_model_type == "qwen3":
+            auto_mappings.update(
+                {
+                    "language_model.decoder.layers.*.self_attention.q_layernorm.weight": "language_model.model.layers.*.self_attn.q_norm.weight",
+                    "language_model.decoder.layers.*.self_attention.k_layernorm.weight": "language_model.model.layers.*.self_attn.k_norm.weight",
+                }
+            )
         mappings = [AutoMapping(megatron_param=m, hf_param=h) for m, h in auto_mappings.items()]
         mappings.extend(
             [
@@ -128,9 +174,12 @@ class EuroVLBridge(MegatronModelBridge):
                     gate="language_model.model.layers.*.mlp.gate_proj.weight",
                     up="language_model.model.layers.*.mlp.up_proj.weight",
                 ),
-                # Vision tower and projector are identical modules on both sides: copy 1:1.
-                AutoMapping(megatron_param="vision_tower.**", hf_param="vision_tower.**"),
-                AutoMapping(megatron_param="multi_modal_projector.**", hf_param="multi_modal_projector.**"),
+                # Vision tower and projector are identical plain nn.Modules on both sides
+                # (not TP-sharded) -> ReplicatedMapping copies 1:1 and replicates across TP.
+                # AutoMapping would fail here: it cannot infer a parallelism type for plain
+                # nn.Linear/Conv2d weights (e.g. multi_modal_projector.fc1.bias).
+                ReplicatedMapping(megatron_param="vision_tower.**", hf_param="vision_tower.**"),
+                ReplicatedMapping(megatron_param="multi_modal_projector.**", hf_param="multi_modal_projector.**"),
             ]
         )
         return MegatronMappingRegistry(*mappings)

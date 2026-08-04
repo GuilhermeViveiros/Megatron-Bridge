@@ -15,9 +15,11 @@
 """Standalone HF reference model for EuroVL (MoonViT + EuroLLM).
 
 This is the pure-transformers definition that ``AutoBridge`` converts to Megatron.
-It bundles the vendored MoonViT vision tower, a 2-layer MLP projector, and a
-``LlamaForCausalLM`` language model, injecting projected image features into the
-text embedding stream at ``image_token_id`` positions via ``masked_scatter``.
+It bundles the vendored MoonViT vision tower, a 2-layer MLP projector, and a causal
+LM built from ``text_config`` via ``AutoModelForCausalLM`` (``LlamaForCausalLM`` for
+EuroLLM, ``Qwen3ForCausalLM`` for the Qwen3EuroVL oracle backbone), injecting projected
+image features into the text embedding stream at ``image_token_id`` positions via
+``masked_scatter``.
 """
 
 from typing import Optional
@@ -27,7 +29,7 @@ import torch.nn as nn
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.moonvit.modeling_moonvit import MoonVitPretrainedModel
@@ -55,7 +57,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
     config_class = EuroVLConfig
     base_model_prefix = "model"
-    _no_split_modules = ["MoonVitEncoderLayer", "LlamaDecoderLayer"]
+    _no_split_modules = ["MoonVitEncoderLayer", "LlamaDecoderLayer", "Qwen3DecoderLayer"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
@@ -63,7 +65,10 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.vision_tower = MoonVitPretrainedModel(config.vision_config)
         self.multi_modal_projector = EuroVLMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config.text_config)
+        # Build whichever causal LM `text_config` describes: LlamaConfig -> LlamaForCausalLM
+        # (EuroLLM, unchanged behavior) or Qwen3Config -> Qwen3ForCausalLM (the Qwen3EuroVL
+        # oracle backbone, incl. QK-norm). Keeps one wrapper for all backbones.
+        self.language_model = AutoModelForCausalLM.from_config(config.text_config)
         self.post_init()
 
     # ------------------------------------------------------------------
