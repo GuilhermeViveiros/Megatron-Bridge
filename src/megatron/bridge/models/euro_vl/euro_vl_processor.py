@@ -113,11 +113,13 @@ class EuroVLProcessor(ProcessorMixin):
         """
         from transformers import AutoTokenizer
 
-        from megatron.bridge.models.euro_vl.moonvit.image_processing_moonvit import MoonViTImageProcessor
+        from megatron.bridge.models.euro_vl.moonvit.image_processing_moonvit import VectorizedMoonViTImageProcessor
         from megatron.bridge.models.euro_vl.moonvit.video_processing_moonvit import MoonViTVideoProcessor
 
         path = pretrained_model_name_or_path
-        image_processor = MoonViTImageProcessor.from_pretrained(path)
+        # Overwritten to vectorized (torchvision) for the PIL-vs-vectorized backend A/B — see
+        # sanity_check/euro_vl_video_notes.md. Was MoonViTImageProcessor (PIL).
+        image_processor = VectorizedMoonViTImageProcessor.from_pretrained(path)
         # Load the video processor then set num_frames as an attribute — passing it
         # through from_pretrained would trip BaseImageProcessor's unknown-kwarg warning.
         video_processor = MoonViTVideoProcessor.from_pretrained(path)

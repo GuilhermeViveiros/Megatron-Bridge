@@ -142,3 +142,52 @@ class MoonViTImageProcessor(BaseImageProcessor):
         data = {"pixel_values": pixel_values, "image_grid_hws": image_grid_hws}
 
         return BatchFeature(data=data, tensor_type=return_tensors)
+
+
+class VectorizedMoonViTImageProcessor(MoonViTImageProcessor):
+    """Vectorized-backend mirror of :class:`MoonViTImageProcessor` (torchvision, not PIL).
+
+    Overrides only ``rescale`` (torchvision bicubic instead of PIL bicubic) and ``_preprocess``
+    (tensor-converts first, so PIL is never touched). ``preprocess`` — the batching loop — is
+    inherited unchanged and dispatches into these overrides polymorphically.
+
+    Introduces a ~5% feature drift vs PIL (measured in ``sanity_check/moonvit_pil_vs_torch.py``).
+    Use only with a TRAINABLE vision encoder, which can absorb the shift during training; a frozen
+    encoder (e.g. PA) must use the base PIL class. See ``sanity_check/euro_vl_video_notes.md``.
+    """
+
+    def rescale(self, image: torch.Tensor, merge_kernel_size: list[int, int] = [2, 2]) -> torch.Tensor:
+        _, h, w = image.shape
+        patch_size = self.patch_size
+
+        if (w // patch_size) * (h // patch_size) > self.in_token_limit:
+            scale = math.sqrt(self.in_token_limit / ((w // patch_size) * (h // patch_size)))
+            new_w, new_h = int(w * scale), int(h * scale)
+            image = TF.resize(image, [new_h, new_w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
+        if self.pad_input:
+            _, new_h, new_w = image.shape
+            pad_size_h = merge_kernel_size[0] * patch_size
+            pad_size_w = merge_kernel_size[1] * patch_size
+
+            pad_h = (pad_size_h - new_h % pad_size_h) % pad_size_h
+            pad_w = (pad_size_w - new_w % pad_size_w) % pad_size_w
+
+            image = TF.pad(image, [0, 0, pad_w, pad_h])
+        else:
+            _, new_h, new_w = image.shape
+            new_w = new_w - new_w % patch_size
+            new_h = new_h - new_h % patch_size
+            image = TF.center_crop(image, [new_h, new_w])
+
+        _, h, w = image.shape
+        if w // patch_size >= 512 or h // patch_size >= 512:
+            raise ValueError("Exceed pos emb")
+
+        return image
+
+    def _preprocess(self, image: ImageInput) -> tuple[torch.Tensor, list[int, int]]:
+        image = self.to_tensor(image)  # PIL -> tensor FIRST, so rescale never touches PIL
+        image = self.rescale(image, self.merge_kernel_size)
+        image = self.normalize(image)
+        patches, grid_hw = self.patchify(image)
+        return patches, grid_hw
