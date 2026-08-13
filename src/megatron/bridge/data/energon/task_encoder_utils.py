@@ -215,6 +215,7 @@ class ChatMLSample(Sample):
     imgs: Optional[List[torch.Tensor]] = None
     videos: Optional[List[List[torch.Tensor]]] = None
     audio: Optional[torch.Tensor] = None  # Raw waveform tensor [num_samples] or pre-computed mel [frames, mel_bins]
+    video_metadata: Optional[List[Optional[dict]]] = None  # per-video dicts (e.g. {"timestamps": [...]})
 
 
 class videohandler:

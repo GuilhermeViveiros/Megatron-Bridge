@@ -169,6 +169,10 @@ def _resolve_target_class(target: str) -> type | None:
         The resolved class, or None if resolution fails.
     """
     try:
+        # HF PretrainedConfig/GenerationConfig serialize as "module.Class.from_dict" (see
+        # yaml_utils._pretrained_config_representer); strip the classmethod suffix so the
+        # target resolves to the owning class instead of a non-importable "module.Class".
+        target = target.removesuffix(".from_dict")
         module_path, class_name = target.rsplit(".", 1)
         module = importlib.import_module(module_path)
         return getattr(module, class_name, None)

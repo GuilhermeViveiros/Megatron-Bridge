@@ -26,6 +26,38 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 NUM_BYTES_IN_MEGABYTE: int = 1024 * 1024
 
 
+def _num_vision_encoder_parameters(model_config) -> int:
+    """Approximate parameter count of a VLM vision encoder + projector.
+
+    Returns 0 for text-only models (no ``vision_config``). Uses a MoonViT/ViT-style
+    analytical estimate (transformer layers + patch embed + spatial-merge projector),
+    reading the same config fields as ``flop_utils.vit_flops`` so the two stay
+    consistent. Accepts both Qwen-style (``depth`` / ``spatial_merge_size``) and
+    standard HF (``num_hidden_layers``) field names.
+    """
+    vision_config = getattr(model_config, "vision_config", None)
+    if vision_config is None:
+        return 0
+    hidden_size = getattr(vision_config, "hidden_size", 0)
+    depth = getattr(vision_config, "depth", 0) or getattr(vision_config, "num_hidden_layers", 0)
+    intermediate_size = getattr(vision_config, "intermediate_size", 0)
+    if not (hidden_size and depth and intermediate_size):
+        return 0
+    patch_size = getattr(vision_config, "patch_size", 14)
+    spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
+    # Per ViT layer: attention (QKV + output ~ 4*h^2) + MLP (fc1 h->i, fc2 i->h ~ 2*h*i)
+    # + a couple of layernorms/biases (~ 4*h).
+    per_layer = 4 * hidden_size**2 + 2 * hidden_size * intermediate_size + 4 * hidden_size
+    transformer = depth * per_layer
+    # Patch embed conv: in_channels(3) * h * patch * patch.
+    patch_embed = 3 * hidden_size * patch_size * patch_size
+    # Spatial-merge projector: (h * merge_area) -> out -> out.
+    merged_hidden = hidden_size * (spatial_merge_size**2)
+    out_hidden = model_config.hidden_size
+    projector = merged_hidden * out_hidden + out_hidden**2 + 2 * out_hidden
+    return transformer + patch_embed + projector
+
+
 def compute_weight_and_optimizer_memory(config: ConfigContainer, verbose: bool = False) -> float:
     """Compute theoretical memory footprint for model weights and optimizer states.
 
@@ -75,7 +107,15 @@ def compute_weight_and_optimizer_memory(config: ConfigContainer, verbose: bool =
         num_parameters_in_embedding_layers = 2 * embedding_size
     else:
         num_parameters_in_embedding_layers = embedding_size
-    num_total_parameters = num_parameters_in_transformer_layers + num_parameters_in_embedding_layers
+    # Vision encoder + projector (VLMs only; 0 for text-only). The vision tower is
+    # replicated across TP ranks and lives on the first pipeline stage, so it is
+    # added whole (not TP/PP-divided) to the total and to the most-loaded shard.
+    num_parameters_in_vision_encoder = _num_vision_encoder_parameters(model_config)
+    num_total_parameters = (
+        num_parameters_in_transformer_layers
+        + num_parameters_in_embedding_layers
+        + num_parameters_in_vision_encoder
+    )
     if verbose:
         print(
             f"Number of parameters in transformer layers in billions: "
@@ -84,6 +124,11 @@ def compute_weight_and_optimizer_memory(config: ConfigContainer, verbose: bool =
         print(
             f"Number of parameters in embedding layers in billions: {num_parameters_in_embedding_layers / 10**9:.2f}"
         )
+        if num_parameters_in_vision_encoder > 0:
+            print(
+                f"Number of parameters in vision encoder in billions: "
+                f"{num_parameters_in_vision_encoder / 10**9:.2f}"
+            )
         print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 embedding layer) / tp_size.
@@ -92,6 +137,8 @@ def compute_weight_and_optimizer_memory(config: ConfigContainer, verbose: bool =
     ) / model_config.tensor_model_parallel_size
     if not model_config.share_embeddings_and_output_weights and model_config.pipeline_model_parallel_size == 1:
         num_parameters_on_most_loaded_model_shard += embedding_size / model_config.tensor_model_parallel_size
+    # Vision tower is replicated (not TP-sharded) and sits on the first pipeline stage.
+    num_parameters_on_most_loaded_model_shard += num_parameters_in_vision_encoder
     if verbose:
         print(
             f"Number of parameters in most loaded shard in billions: "

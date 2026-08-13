@@ -1211,6 +1211,18 @@ class ConfigContainer(Container):
             )
             self.validation.eval_micro_batch_size = self.train.micro_batch_size
 
+        # Some dataset providers (e.g. EnergonProvider) carry their own micro/global batch
+        # size, captured at recipe-build time — before CLI overrides are applied. Keep them
+        # in sync with the (post-override) training batch sizes so callers only need to set
+        # train.micro_batch_size / train.global_batch_size.
+        if (
+            self.dataset is not None
+            and hasattr(self.dataset, "micro_batch_size")
+            and hasattr(self.dataset, "global_batch_size")
+        ):
+            self.dataset.micro_batch_size = self.train.micro_batch_size
+            self.dataset.global_batch_size = self.train.global_batch_size
+
         # Eval batch size divisibility check
         eval_dp_product = self.validation.eval_micro_batch_size * self.data_parallel_size
         assert self.validation.eval_global_batch_size % eval_dp_product == 0, (

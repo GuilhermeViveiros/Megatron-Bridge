@@ -25,7 +25,12 @@ from PIL import Image  # noqa: F401  # may be used downstream by processors
 
 from megatron.bridge.data.datasets.utils import IGNORE_INDEX
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
-from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs, Qwen2_5_VLVisualInputs, Qwen2AudioInputs
+from megatron.bridge.training.utils.visual_inputs import (
+    EuroVLVisualInputs,
+    GenericVisualInputs,
+    Qwen2AudioInputs,
+    Qwen2_5_VLVisualInputs,
+)
 
 
 # Local message used when optional qwen_vl_utils dependency is missing
@@ -80,11 +85,31 @@ def create_multiturn_loss_mask_by_search(
     ids = input_ids.tolist()
     mask = [0] * len(ids)
 
+    # Token(s) a bare newline produces. SentencePiece tokenizers drop the leading "▁"
+    # prefix from a word that follows a newline, so a response that comes right after
+    # "<|im_start|>assistant\n" tokenizes differently standalone (▁from) vs in-context
+    # (bare from). Reproducing the newline context and stripping the leading newline
+    # token(s) recovers the in-context form. See sanity_check/debug_loss_mask.py.
+    newline_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
+
+    def candidate_spans(span_text: str) -> list[list[int]]:
+        """Return candidate token sequences to search for a given assistant span.
+
+        Includes the standalone form (works for BPE / space-delimited templates) and
+        the newline-context form with leading newline token(s) stripped (works for
+        SentencePiece templates where the response follows a newline).
+        """
+        spans: list[list[int]] = []
+        for text in (span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"):
+            spans.append(tokenizer(text, add_special_tokens=False)["input_ids"])
+            nl_span = tokenizer("\n" + text, add_special_tokens=False)["input_ids"]
+            if newline_ids and nl_span[: len(newline_ids)] == newline_ids:
+                spans.append(nl_span[len(newline_ids) :])
+        return spans
+
     def try_mark(span_text: str, start_from: int) -> int:
         """Tokenize a span and mark its occurrence if found. Returns new search start index."""
-        variants = [span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"]
-        for text in variants:
-            span_tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        for span_tokens in candidate_spans(span_text):
             if not span_tokens:
                 continue
             # naive sequential search from start_from
@@ -1329,6 +1354,77 @@ def kimi_k25_vl_collate_fn(
 
 
 # Mapping of processor types to their collate functions
+def euro_vl_collate_fn(examples: list, processor) -> dict:
+    """Collate function for EuroVL (MoonViT + EuroLLM).
+
+    Args:
+        examples:  List of dicts with a ``"conversation"`` key (ChatML messages).
+        processor: ``EuroVLProcessor`` wrapping MoonViTImageProcessor + EuroLLM tokenizer.
+
+    Returns:
+        Batch dict with ``input_ids``, ``labels``, ``loss_mask``,
+        ``position_ids``, ``attention_mask``, and ``visual_inputs``.
+    """
+    skipped_tokens = extract_skipped_token_ids(processor)
+
+    texts = [
+        processor.apply_chat_template(
+            example["conversation"], tokenize=False, add_generation_prompt=False
+        )
+        for example in examples
+    ]
+
+    # Extract PIL images from the structured conversation content.
+    images = []
+    for example in examples:
+        imgs = []
+        for msg in example["conversation"]:
+            for item in msg.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "image" and "image" in item:
+                    imgs.append(item["image"])
+        images.append(imgs if imgs else None)
+
+    # EuroVLProcessor expands <image> → <image>*N and tokenizes.
+    batch = processor(text=texts, images=images, padding=True, return_tensors="pt")
+
+    input_ids = batch["input_ids"]
+
+    # Labels: shift input_ids by 1, mask padding and skipped tokens.
+    labels = input_ids.clone()[:, 1:].contiguous()
+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+    labels[torch.isin(labels, skipped_tokens)] = -100
+
+    # Loss mask: 1 only on assistant response tokens (tokenizer-agnostic search).
+    loss_masks = [
+        create_multiturn_loss_mask_by_search(example, input_ids[i], processor, skipped_tokens)
+        for i, example in enumerate(examples)
+    ]
+    loss_mask = torch.tensor(loss_masks, dtype=torch.float, device=input_ids.device)
+    loss_mask = torch.cat([loss_mask[:, 1:], torch.zeros_like(loss_mask[:, :1])], dim=1)
+    labels = labels.masked_fill(loss_mask == 0, -100)
+
+    batch_size, seq_len = input_ids.shape
+    position_ids = (
+        torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).clone().contiguous()
+    )
+
+    # EuroVLProcessor already emits the codebase-standard image_grid_thw [num_images, 3]
+    # = (t=1, h, w) (MoonViT is 2D; t is a unit dim). Pass it straight through.
+    visual_inputs = EuroVLVisualInputs(
+        pixel_values=batch.get("pixel_values"),
+        image_grid_thw=batch.get("image_grid_thw"),
+    )
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "attention_mask": batch.get("attention_mask"),
+        "visual_inputs": visual_inputs,
+    }
+
+
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
     "Qwen3VLProcessor": qwen2_5_collate_fn,
@@ -1339,5 +1435,6 @@ COLLATE_FNS = {
     "Qwen2AudioProcessor": qwen2_audio_collate_fn,
     "Glm4vProcessor": glm4v_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
+    "EuroVLProcessor": euro_vl_collate_fn,
     "default": default_collate_fn,
 }

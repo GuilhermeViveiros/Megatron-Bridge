@@ -99,7 +99,15 @@ def masked_next_token_loss(
             fatal=False,
         )
 
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    # num_tokens is the loss denominator: the sum of loss-mask weights. With fractional
+    # per-token weights (e.g. EuroVL sqrt loss, w=1/sqrt(T_i)) this is Sum_i sqrt(T_i),
+    # not a token count. MCore's schedule accumulates it into a hard-coded int tensor
+    # (schedules.py: total_num_tokens, dtype=torch.int — 3rdparty, unmodifiable) and an
+    # in-place int += float RAISES, so we must return an integer tensor. Round to nearest
+    # (NOT floor): exact for binary 0/1 masks (integer-valued sums — original behavior),
+    # and <=0.5 absolute (~<=0.2%, symmetric) per micro-batch for weighted masks. The
+    # sqrt *ratios* between samples live in the numerator weights and are unaffected.
+    num_tokens = loss_mask.sum().clone().detach().round().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     return (loss, num_tokens, {"lm loss": reporting_loss})

@@ -1129,8 +1129,32 @@ def training_log(
             else:
                 num_flops = num_floating_point_operations(config, batch_size)
             per_gpu_tf = num_flops / elapsed_time_per_iteration / get_world_size_safe() / 1e12
+            # ETA to end of run (blank if train_iters unknown, e.g. sample-based training).
+            # elapsed_time_per_iteration is only the LAST log_interval's average (a single step at
+            # log_interval=1), so multiplying it by remaining iters would swing with per-step noise
+            # and be wildly off during the warmup/compile step. Smooth it with an EMA over logged
+            # steps, seeded on the *second* step so the first (large warmup outlier) is dropped.
+            train_iters = getattr(getattr(config, "train", None), "train_iters", None)
+            eta = ""
+            if train_iters:
+                avg = getattr(global_state, "_eta_avg_s", None)
+                if avg is None:
+                    avg = elapsed_time_per_iteration  # 1st logged step (warmup) — provisional
+                elif getattr(global_state, "_eta_warmup", True):
+                    avg = elapsed_time_per_iteration  # 2nd step — reset, discard warmup outlier
+                    global_state._eta_warmup = False
+                else:
+                    avg = 0.1 * elapsed_time_per_iteration + 0.9 * avg  # EMA over subsequent steps
+                global_state._eta_avg_s = avg
+                rem_iters = max(0, train_iters - iteration)
+                secs = int(rem_iters * avg)
+                d, r = divmod(secs, 86400)
+                h, r = divmod(r, 3600)
+                m = r // 60
+                hms = (f"{d}d" if d else "") + (f"{h}h" if (d or h) else "") + f"{m}m"
+                eta = f"  ETA: {hms} ({rem_iters} iters left)"
             print_rank_0(
-                f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU"
+                f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU{eta}"
             )
 
         # throughput

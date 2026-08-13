@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from torch import int_repr
@@ -25,7 +25,7 @@ from megatron.bridge.data.utils import DatasetBuildContext, DatasetProvider
 class EnergonProvider(DatasetProvider):
     """Energon Provider."""
 
-    path: str
+    path: str = ""  # may be generated at runtime by a subclass (e.g. EuroVLEnergonProvider)
     image_processor: Optional[Any] = None
     seq_length: int
     micro_batch_size: int
@@ -33,11 +33,31 @@ class EnergonProvider(DatasetProvider):
     num_workers: int_repr
     dataloader_type: str = "external"
     task_encoder: Optional[Any] = None
-    # Enable batch-level online sequence packing
+    # Enable batch-level online sequence packing (vlm_step in-batch packer).
     pack_sequences_in_batch: bool = False
+    # Enable energon fill-to-seq_length packing: buffers this many encoded samples and
+    # packs each training sequence up to seq_length (task encoder must implement the
+    # select_samples_to_pack / pack_selected_samples hooks). None disables.
+    packing_buffer_size: Optional[int] = None
+    # Max samples loaded from a tar shard at once (energon); None loads the whole shard.
+    max_samples_per_sequence: Optional[int] = None
+    # Empty by default -> no behavior change. Used e.g. to set ``auto_decode=False``
+    energon_dataset_kwargs: dict = field(default_factory=dict)
 
     def build_datasets(self, context: DatasetBuildContext):
         assert self.path, "EnergonProvider.path must be set. Use CLI override: dataset.path=<path>"
+        # The two packing modes are mutually exclusive: energon packing already yields
+        # sequences pre-packed to seq_length with cu_seqlens; the in-batch packer would
+        # re-concatenate and corrupt those boundaries.
+        if self.packing_buffer_size is not None:
+            assert not self.pack_sequences_in_batch, (
+                "packing_buffer_size (energon fill-to-seq_length packing) is mutually exclusive "
+                "with pack_sequences_in_batch (vlm_step in-batch packing)."
+            )
+            assert self.micro_batch_size == 1, (
+                "energon packing yields one packed sequence per batch; set "
+                f"train.micro_batch_size=1 (got {self.micro_batch_size}). THD/CP requires it."
+            )
         if (
             self.pack_sequences_in_batch
             and self.task_encoder is not None
@@ -53,7 +73,10 @@ class EnergonProvider(DatasetProvider):
             micro_batch_size=self.micro_batch_size,
             global_batch_size=self.global_batch_size,
             num_workers=self.num_workers,
+            packing_buffer_size=self.packing_buffer_size,
+            max_samples_per_sequence=self.max_samples_per_sequence,
             pg_collection=context.pg_collection,
+            **self.energon_dataset_kwargs,
         )
         return (
             iter(dataset.train_dataloader()),

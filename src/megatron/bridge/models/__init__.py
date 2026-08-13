@@ -32,6 +32,11 @@ from megatron.bridge.models.deepseek import (
     DeepSeekV2Bridge,
     DeepSeekV3Bridge,
 )
+from megatron.bridge.models.euro_vl import (
+    EuroVLBridge,
+    EuroVLModel,
+    EuroVLModelProvider,
+)
 from megatron.bridge.models.falcon_h1 import (
     FalconH1Bridge,
     FalconH1ModelProvider,
@@ -170,6 +175,10 @@ __all__ = [
     # DeepSeek Models
     "DeepSeekV2Bridge",
     "DeepSeekV3Bridge",
+    # EuroVL
+    "EuroVLBridge",
+    "EuroVLModel",
+    "EuroVLModelProvider",
     "FalconH1Bridge",
     "FalconH1ModelProvider",
     "Gemma3ModelProvider",
