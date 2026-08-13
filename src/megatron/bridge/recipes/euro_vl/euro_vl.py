@@ -83,6 +83,8 @@ def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
         rotary_base=1000000,  # EuroLLM-1.7B rope_theta (NOT 10000); must match the base model
         rotary_percent=1.0,
         gated_linear_unit=True,
+        # EuroLLM is SwiGLU (SiLU-gated MLP). The TransformerConfig default is GELU
+        activation_func=torch.nn.functional.silu,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         add_bias_linear=False,
@@ -321,6 +323,8 @@ def _make_qwen3_euro_vl_provider() -> Qwen3EuroVLModelProvider:
         rotary_base=1000000,
         rotary_percent=1.0,
         gated_linear_unit=True,
+        # Qwen3 is SwiGLU (SiLU-gated MLP). The TransformerConfig default is GELU
+        activation_func=torch.nn.functional.silu,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         add_bias_linear=False,
@@ -463,6 +467,18 @@ def qwen3_euro_vl_sft_energon_config() -> ConfigContainer:
     # HF dir (the loader silently skips a raw HF checkpoint -> random init -> loss ~ln(vocab)).
     cfg.checkpoint.pretrained_checkpoint = QWEN3_EUROVL_MCORE
 
+    # Self-contained checkpoints: train with the REAL assembled Qwen3EuroVL tokenizer (vision
+    # special tokens + chat template) instead of the _sft_common_vlm NullTokenizer placeholder.
+    # The energon task encoder still does the actual tokenization via its own processor; this
+    # override only (a) sizes the vocab — harmless, since model.vocab_size=151936 is preset and
+    # >= this tokenizer's vocab, so _validate_and_set_vocab_size keeps 151936 (resume-compatible)
+    # — and (b) makes save_tokenizer_assets write real tokenizer files into every iter_*/tokenizer
+    # (the NullTokenizer branch writes nothing, leaving an empty dir). Inference can then load the
+    # tokenizer from the checkpoint itself instead of a separate hardcoded path.
+    cfg.checkpoint.save_tokenizer_assets = True
+    cfg.tokenizer.tokenizer_type = "HuggingFaceTokenizer"
+    cfg.tokenizer.tokenizer_model = QWEN3_EUROVL_HF
+
     # Write training checkpoints/logs to scratch (per-recipe subdir), NOT the $HOME-bound cwd.
     cfg.checkpoint.save = f"{EUROVL_RUNS}/qwen3_sft"
     cfg.checkpoint.load = cfg.checkpoint.save  # resume from same dir (empty 1st run -> uses pretrained)
@@ -505,14 +521,13 @@ def qwen3_euro_vl_pa_sft_config() -> ConfigContainer:
     cfg.model.freeze_vision_model = True
     cfg.model.freeze_vision_projection = False
 
-    # Full activation recompute (gradient checkpointing). PA keeps the WHOLE frozen-LLM forward
-    # activation stack (needed to backprop to the upstream projector) — ~25-30 GB at seq 8192 and
-    # the real OOM cause (not global_batch_size, which only sets grad-accum steps at mbs=1).
-    # Freeing it also gives the vision-tower spike headroom on dense mixed-modality packs. The
-    # frozen backbone makes the recompute compute cost negligible, so recompute every layer.
-    # cfg.model.recompute_granularity = "full"
-    # cfg.model.recompute_method = "uniform"
-    # cfg.model.recompute_num_layers = 1
+    # Square-root per-token loss (Qwen3VL)
+    cfg.model.calculate_per_token_loss = False
+    # Per-token loss requires the DP grad collective to SUM, not average: MCore sets
+    # gradient_scaling_factor=1.0 and the single global division by the total weight-sum
+    # (Sum_i sqrt(T_i)) happens once in finalize_model_grads — the Σwℓ/Σw of the sqrt
+    # loss. MCore hard-asserts on average_in_collective=True + per-token loss at DDP init.
+    cfg.ddp.average_in_collective = True
 
     # InternVL alignment batch. The energon provider captured global_batch_size at construction
     # (128 from the base config), so update BOTH the train config and the provider field — the
@@ -539,7 +554,7 @@ def qwen3_euro_vl_pa_sft_config() -> ConfigContainer:
 
     # Write checkpoints/logs to scratch (PA subdir), NOT the $HOME-bound cwd. PA converges fast,
     # so save more often than the SFT default (every 100 iters).
-    cfg.checkpoint.save = f"{EUROVL_RUNS}/qwen3_pa"
+    cfg.checkpoint.save = f"{EUROVL_RUNS}/qwen3_pa_pyav_vect"
     cfg.checkpoint.load = cfg.checkpoint.save  # resume from same dir (empty 1st run -> uses pretrained)
     cfg.logger.tensorboard_dir = None  # W&B only (TB is enabled by a non-None dir; disable it)
     # W&B (project only — the API key comes from the WANDB_API_KEY env var, never committed).

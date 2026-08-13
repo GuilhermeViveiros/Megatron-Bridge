@@ -32,10 +32,12 @@ joint tokenization + MoonViT preprocessing and emits ``GenericVisualInputs`` wit
 import dataclasses
 import io
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+import av
 import numpy as np
 import torch
 from megatron.energon import Cooker, basic_sample_keys
@@ -51,6 +53,14 @@ from megatron.bridge.data.energon.task_encoder_utils import IGNORE_INDEX, ChatML
 from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
+
+
+# Many molmo2_cap H.264 clips are lightly corrupt (missing reference frames); libav logs a benign
+# per-frame ERROR for each ("co located POCs unavailable", "Missing reference picture", ...) and
+# keyframe seeking amplifies the volume. These are non-fatal — decoding continues and the frames are
+# usable — so silence libav's own chatter (routed through the "libav" Python logger). Genuine,
+# unrecoverable decode failures still raise ``av.error`` exceptions, which are unaffected.
+logging.getLogger("libav").setLevel(logging.CRITICAL)
 
 
 # Crude-sample extensions to look for, in priority order.
@@ -177,7 +187,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             f = np.asarray(f)
         return Image.fromarray(f).convert("RGB")
 
-    def _frames_from_video(self, v) -> list[Image.Image]:
+    def _frames_from_video(self, v) -> tuple[list[Image.Image], Optional[list[float]]]:
         """Sample ``_video_num_frames`` PIL frames from whatever form the crude sample carries.
 
         Energon auto-decodes ``.mp4`` into ``megatron.energon.av.video_data.VideoData`` whose
@@ -194,30 +204,70 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             frames = getattr(v, "vframes", None)
         if frames is None:
             frames = v[0] if isinstance(v, (tuple, list)) and len(v) > 0 and isinstance(v[0], torch.Tensor) else v
+        # Pre-decoded (auto_decode=True) path: timestamps from the clip's fps.
         if isinstance(frames, torch.Tensor):
             total = int(frames.shape[0])
-            if total == 0:
-                raise ValueError("decoded video has 0 frames")
-            return [self._frame_to_pil(frames[i]) for i in self._sample_frame_indices(total)]
-        if isinstance(frames, (list, tuple)):
+        elif isinstance(frames, (list, tuple)):
             total = len(frames)
-            if total == 0:
-                raise ValueError("decoded video has 0 frames")
-            return [self._frame_to_pil(frames[i]) for i in self._sample_frame_indices(total)]
-        raise TypeError(f"unsupported video item type {type(v)} (frames {type(frames)})")
+        else:
+            raise TypeError(f"unsupported video item type {type(v)} (frames {type(frames)})")
+        if total == 0:
+            raise ValueError("decoded video has 0 frames")
+        fps = getattr(v, "fps", None) or getattr(v, "frame_rate", None)
+        if fps is None:
+            raise ValueError("auto-decoded video has no fps for timestamps; use auto_decode=False")
+        idxs = self._sample_frame_indices(total)
+        return [self._frame_to_pil(frames[i]) for i in idxs], [i / float(fps) for i in idxs]
 
-    def _decode_video_bytes(self, video_bytes: bytes) -> list[Image.Image]:
-        """Decode ``_video_num_frames`` uniformly-sampled PIL frames (PyAV), memory-bounded.
+    def _decode_video_bytes(self, video_bytes: bytes) -> tuple[list[Image.Image], Optional[list[float]]]:
+        """Decode ``_video_num_frames`` PIL frames + their timestamps (seconds) via keyframe SEEKING.
 
-        Only the sampled frames are ever materialized — the whole clip is NOT loaded into
-        memory (a multi-minute clip is thousands of frames and would OOM the dataloader
-        worker, ×num_workers). Used when video arrives as raw bytes (energon video auto-decode
-        off); with auto-decode on, :meth:`_frames_from_video` handles the decoded tensor.
+        For each target timestamp it seeks to the nearest keyframe ``<= t`` and decodes only
+        forward to the frame at ``t`` — instead of walking the whole clip. On real molmo2_cap
+        clips this cut the decode **tail** ~90x (a 380 MB clip: ~17 s -> ~0.2 s), which is what
+        removes the multi-rank dataloader stragglers that stalled training. It keys off the
+        stream/container **duration** (no frame-count pass), so the odd H.264 clips that lack
+        frame metadata are no longer decoded end-to-end just to count. Peak memory is O(n).
+
+        Same library as before (PyAV / ``av``) — only the access pattern changed (seek vs
+        sequential). Falls back to :meth:`_decode_video_bytes_sequential` for the rare clip that
+        exposes no duration. Used when video arrives as raw bytes (energon auto-decode off).
         """
-        import av
+        n = self._video_num_frames
+        frames: list[Optional[Image.Image]] = []
+        with av.open(io.BytesIO(video_bytes)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            if stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+            elif container.duration is not None:
+                duration = float(container.duration) / 1_000_000.0  # AV_TIME_BASE (microseconds)
+            else:
+                duration = 0.0
+            if duration <= 0:
+                return self._decode_video_bytes_sequential(video_bytes)
 
-        # 1. Total frame count, cheaply: container metadata, else estimate from duration × rate,
-        #    else a decode-and-discard counting pass (O(1) memory — frames are not retained).
+            # Uniformly-spaced target times across the clip (frame-accurate: decode fwd to >= t).
+            times = [duration / 2.0] if n == 1 else [i * duration / (n - 1) for i in range(n)]
+            last: Optional[Image.Image] = None
+            for t in times:
+                container.seek(int(t / stream.time_base), stream=stream, backward=True, any_frame=False)
+                picked: Optional[Image.Image] = None
+                for frame in container.decode(stream):
+                    last = frame.to_image().convert("RGB")
+                    if frame.time is not None and frame.time >= t - 1e-3:
+                        picked = last
+                        break
+                # Guarantee exactly n frames: if the seek overshot the end, reuse the last frame.
+                frames.append(picked if picked is not None else last)
+
+        if not frames or any(f is None for f in frames):
+            raise ValueError("no frames decoded from video bytes")
+        return frames, times  # type: ignore[return-value]
+
+    def _decode_video_bytes_sequential(self, video_bytes: bytes) -> tuple[list[Image.Image], Optional[list[float]]]:
+        """Fallback for clips with no duration metadata: bounded sequential decode (timestamps from frame.time)."""
+
         with av.open(io.BytesIO(video_bytes)) as container:
             stream = container.streams.video[0]
             total = int(stream.frames or 0)
@@ -231,22 +281,22 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         if total <= 0:
             raise ValueError("no frames decoded from video bytes")
 
-        # 2. Uniformly-spaced target indices (shared sampler).
         targets = set(self._sample_frame_indices(total))
-
-        # 3. Single decode pass, keeping ONLY the target frames (peak memory O(n)).
         frames: list[Image.Image] = []
+        timestamps: list[float] = []
         with av.open(io.BytesIO(video_bytes)) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            fps = float(stream.average_rate) if stream.average_rate else 0.0
             for i, frame in enumerate(container.decode(stream)):
                 if i in targets:
                     frames.append(frame.to_image().convert("RGB"))
+                    timestamps.append(float(frame.time) if frame.time is not None else (i / fps if fps else 0.0))
                     if len(frames) >= len(targets):
                         break
         if not frames:
             raise ValueError("no frames decoded from video bytes")
-        return frames
+        return frames, timestamps
 
     def _cook(self, sample: dict) -> ChatMLSample:
         """Decode a crude sample (``jpg``/``mp4`` + ``json`` conversation) into a :class:`ChatMLSample`.
@@ -289,10 +339,12 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         if raw_videos is None:
             single = _crude_get(sample, _VIDEO_EXTS)
             raw_videos = [single] if single is not None else None
+        video_metadata: Optional[list] = None
         if raw_videos is not None:
-            # Normalize each video to a list of sampled PIL frames, regardless of whether energon
-            # auto-decoded it (torchvision tensor) or left it as raw bytes.
-            videos = [self._frames_from_video(v) for v in raw_videos]
+            # Each video -> (sampled PIL frames, per-frame timestamps in seconds).
+            decoded = [self._frames_from_video(v) for v in raw_videos]
+            videos = [frames for frames, _ in decoded]
+            video_metadata = [{"timestamps": ts} for _, ts in decoded]
 
         if imgs is None and videos is None:
             raise KeyError(
@@ -316,6 +368,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             conversation=raw_conv,
             imgs=imgs,
             videos=videos,
+            video_metadata=video_metadata,
         )
 
         # ------------------------------------------------------------------

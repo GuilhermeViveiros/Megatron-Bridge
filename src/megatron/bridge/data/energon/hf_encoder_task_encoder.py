@@ -210,6 +210,10 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
             proc_kwargs["min_pixels"] = self.min_pixels
         if self.max_pixels is not None:
             proc_kwargs["max_pixels"] = self.max_pixels
+        # Optional per-video metadata (e.g. real frame timestamps) if the sample carries it.
+        vmeta = getattr(sample, "video_metadata", None)
+        if vmeta is not None and videos_pil is not None:
+            proc_kwargs["video_metadata"] = vmeta
 
         proc_output = self.processor(**proc_kwargs)
 
