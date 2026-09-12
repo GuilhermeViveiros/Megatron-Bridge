@@ -29,6 +29,7 @@ live at separate paths — so ``from_pretrained`` takes both paths explicitly.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Union
 
 import numpy as np
@@ -39,6 +40,9 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.video_utils import make_batched_videos
 
 from megatron.bridge.models.euro_vl.utils import format_timestamp
+
+
+logger = logging.getLogger(__name__)
 
 
 class EuroVLProcessor(ProcessorMixin):
@@ -61,7 +65,6 @@ class EuroVLProcessor(ProcessorMixin):
         video_processor=None,
         tokenizer=None,
         chat_template=None,
-        video_preprocess_mode: str = "pil",
         timestamp_format: str = "seconds",
         default_fps: float = 2.0,
         **kwargs,
@@ -72,13 +75,6 @@ class EuroVLProcessor(ProcessorMixin):
         self.video_processor = video_processor
         self.tokenizer = tokenizer
         self.chat_template = chat_template
-        # Video preprocessing path:
-        #   "pil"        -> bit-identical to images; safe for frozen-vision PA (default)
-        #   "vectorized" -> tensor-native, faster, ~5% feature diff; use once the
-        #                   encoder is unfrozen / trained with a small LR (SFT, long video)
-        if video_preprocess_mode not in ("pil", "vectorized"):
-            raise ValueError(f"video_preprocess_mode must be 'pil' or 'vectorized', got {video_preprocess_mode!r}")
-        self.video_preprocess_mode = video_preprocess_mode
         # Per-frame timestamp prefix (Qwen3-VL style): "seconds", "hms", or "random".
         # "random" mixes both formats per video so the model learns diverse timecodes.
         self.timestamp_format = timestamp_format
@@ -91,11 +87,16 @@ class EuroVLProcessor(ProcessorMixin):
     def from_pretrained(  # type: ignore[override]
         cls,
         pretrained_model_name_or_path: str,
-        num_frames: int = 8,
         chat_template: Optional[str] = None,
-        video_preprocess_mode: str = "pil",
         timestamp_format: str = "seconds",
         default_fps: float = 2.0,
+        fps: float = 1.0,
+        min_frames: int = 2,
+        max_frames: int = 64,
+        min_pixels: int = 40_000,
+        max_pixels: int = 802_816,
+        seq_length: Optional[int] = None,
+        budget_fraction: float = 0.85,
     ) -> "EuroVLProcessor":
         """Build the processor from a single EuroVL checkpoint directory.
 
@@ -105,25 +106,47 @@ class EuroVLProcessor(ProcessorMixin):
 
         Args:
             pretrained_model_name_or_path: Path to the EuroVL HF checkpoint directory.
-            num_frames:     Default number of frames to sample per video.
             chat_template:  Optional Jinja chat template string (else taken from tokenizer).
-            video_preprocess_mode: "pil" (default, frozen-vision safe) or "vectorized".
             timestamp_format: per-frame timestamp format — "seconds", "hms", or "random".
-            default_fps: fallback fps when video_metadata is not provided.
+            default_fps: fallback fps for TIMESTAMP TEXT when video_metadata doesn't supply one
+                (distinct from ``fps`` below, which drives frame SAMPLING).
+            fps: Target frames sampled per second of clip duration (frame-count policy).
+            min_frames / max_frames: Bounds on the fps-derived frame count.
+            min_pixels / max_pixels: Bounds on a single resized frame's pixel count.
+            seq_length: If given, sets the video token budget to
+                ``budget_fraction * seq_length * factor**2`` (``factor`` = patch*merge = 28),
+                matching the model's actual context length. If ``None``, keeps
+                ``MoonViTVideoProcessor``'s built-in default (equivalent to seq_length=8192).
+            budget_fraction: Fraction of ``seq_length`` the video budget may spend (see above).
         """
         from transformers import AutoTokenizer
 
-        from megatron.bridge.models.euro_vl.moonvit.image_processing_moonvit import VectorizedMoonViTImageProcessor
+        from megatron.bridge.models.euro_vl.moonvit.image_processing_moonvit import MoonViTImageProcessor
         from megatron.bridge.models.euro_vl.moonvit.video_processing_moonvit import MoonViTVideoProcessor
 
         path = pretrained_model_name_or_path
-        # Overwritten to vectorized (torchvision) for the PIL-vs-vectorized backend A/B — see
-        # sanity_check/euro_vl_video_notes.md. Was MoonViTImageProcessor (PIL).
-        image_processor = VectorizedMoonViTImageProcessor.from_pretrained(path)
-        # Load the video processor then set num_frames as an attribute — passing it
-        # through from_pretrained would trip BaseImageProcessor's unknown-kwarg warning.
+        # MoonViTImageProcessor resizes with torchvision (not the reference's PIL) — the former
+        # VectorizedMoonViTImageProcessor subclass, folded back into the base class once video
+        # landed its own batched path. See that class's module docstring.
+        image_processor = MoonViTImageProcessor.from_pretrained(path)
+        # Load the video processor then set attributes directly — passing them through
+        # from_pretrained would trip BaseImageProcessor's unknown-kwarg warning.
         video_processor = MoonViTVideoProcessor.from_pretrained(path)
-        video_processor.num_frames = num_frames
+        video_processor.fps = fps
+        video_processor.min_frames = min_frames
+        video_processor.max_frames = max_frames
+        video_processor.min_pixels = min_pixels
+        video_processor.max_pixels = max_pixels
+        if seq_length is not None:
+            video_processor.total_pixels = int(budget_fraction * seq_length * video_processor._merge_factor**2)
+            logger.info(
+                "Video token budget: total_pixels=%d (budget_fraction=%.2f * seq_length=%d * merge_factor^2=%d)",
+                video_processor.total_pixels, budget_fraction, seq_length, video_processor._merge_factor**2,
+            )
+        logger.info(
+            "Video smart-resize policy: fps=%.2f frames=[%d,%d] pixels=[%d,%d] total_pixels=%d",
+            fps, min_frames, max_frames, min_pixels, max_pixels, video_processor.total_pixels,
+        )
         tokenizer = AutoTokenizer.from_pretrained(path)
         if chat_template is None:
             chat_template = getattr(tokenizer, "chat_template", None)
@@ -132,7 +155,6 @@ class EuroVLProcessor(ProcessorMixin):
             video_processor=video_processor,
             tokenizer=tokenizer,
             chat_template=chat_template,
-            video_preprocess_mode=video_preprocess_mode,
             timestamp_format=timestamp_format,
             default_fps=default_fps,
         )
@@ -221,10 +243,7 @@ class EuroVLProcessor(ProcessorMixin):
             # Normalize to a list of videos (each a list of frames), matching
             # transformers' video batching used by apply_chat_template.
             videos = make_batched_videos(videos)
-            if self.video_preprocess_mode == "vectorized":
-                video_inputs = self.video_processor.vectorized_preprocess(videos, return_tensors="pt")
-            else:
-                video_inputs = self.video_processor.preprocess_videos(videos, return_tensors="pt")
+            video_inputs = self.video_processor.vectorized_preprocess(videos, return_tensors="pt")
             video_grid_thw = video_inputs["video_grid_thw"]  # [num_videos, 3] = (t, h, w)
 
             # Qwen3-VL-style per-frame timestamped blocks. Each frame becomes:
