@@ -294,13 +294,33 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
 
         # 8b. Slice visual tensors to keep only complete images
         if num_complete_images < num_images:
+            # pixel_values has one row per PATCH (sum of h_i*w_i across images), not per image,
+            # so it can't be cropped by :num_complete_images like image_grid_thw (one row per
+            # image) -- need the patch-count boundary instead, read off the already-correct
+            # per-image grid.
+            grid = visual_tensors.get("image_grid_thw")
+            n_patches_kept = None
+            if grid is not None and grid.shape[0] == num_images:
+                n_patches_kept = int(grid[:num_complete_images, 1:].prod(dim=1).sum())
+
             for key in list(visual_tensors.keys()):
                 t = visual_tensors[key]
-                if t is not None and t.dim() >= 1 and t.shape[0] == num_images:
-                    if num_complete_images > 0:
-                        visual_tensors[key] = t[:num_complete_images]
-                    else:
-                        del visual_tensors[key]
+                if t is None:
+                    continue
+                if key == "pixel_values" and n_patches_kept is not None:
+                    # Patch-count slice, not the generic image-count branch below.
+                    keep = n_patches_kept
+                elif t.dim() >= 1 and t.shape[0] == num_images:
+                    # Generic case: one row per image (image_grid_thw and any future
+                    # per-image tensor) -- kept as-is for back-compat.
+                    keep = num_complete_images
+                else:
+                    continue
+
+                if keep > 0:
+                    visual_tensors[key] = t[:keep]
+                else:
+                    del visual_tensors[key]
 
         return HFEncoderTaskSample(
             __key__=sample.__key__,

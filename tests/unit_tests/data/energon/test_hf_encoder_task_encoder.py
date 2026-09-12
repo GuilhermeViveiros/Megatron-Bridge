@@ -150,6 +150,64 @@ class TestHFEncoderVLMTaskEncoderEncodeSample(unittest.TestCase):
         encoded = encoder.encode_sample(sample)
         self.assertEqual(encoded.input_ids.shape[0], 50)
 
+    def test_truncation_slices_pixel_values_by_patch_count_not_image_count(self):
+        """Native-res ``pixel_values`` has one row per PATCH (sum of h_i*w_i across images), not
+        one row per image like ``image_grid_thw`` -- truncation must slice it by patch count, not
+        by the generic ``shape[0] == num_images`` check that correctly handles ``image_grid_thw``.
+
+        3 images, patch grids (h,w) = (2,2)=4, (3,3)=9, (4,4)=16 patches -> pixel_values has
+        4+9+16=29 rows, deliberately != num_images=3, mirroring the real MoonViT/Qwen3-VL-style
+        processor output this bug was found against (molmo2_table, see the investigation this
+        test codifies). ``seq_length`` is set to truncate exactly after the first two images'
+        token blocks, dropping the third entirely.
+        """
+        image_token_id = 99
+        # [prefix(3)] [img0 block(3)] [mid(2)] [img1 block(4)] [mid(2)] [img2 block(5)] [suffix(2)]
+        ids = [1, 2, 3] + [image_token_id] * 3 + [4, 5] + [image_token_id] * 4 + [6, 7] + [image_token_id] * 5 + [20, 21]
+        input_ids = torch.tensor([ids])  # length 21; img2 block spans positions [14, 19)
+
+        pixel_values = torch.randn(29, 3, 14, 14)  # 4 + 9 + 16 patches, all 3 images
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 4, 4]])
+
+        processor = MagicMock()
+        processor.tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+        processor.tokenizer.apply_chat_template.return_value = "prompt"
+        processor.tokenizer.encode.return_value = [20, 21]
+        processor.image_token_id = image_token_id
+        processor.return_value = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+        }
+
+        # seq_length=14 keeps positions [0,14) -- through the end of "mid", i.e. exactly the two
+        # complete image blocks (ending at 6 and 12) -- and excludes img2's block (starts at 14).
+        encoder = HFEncoderVLMTaskEncoder(
+            processor=processor, seq_length=14, visual_keys=("pixel_values", "image_grid_thw")
+        )
+        sample = _make_chatml_sample(
+            conversation=json.dumps(
+                [
+                    {"role": "user", "content": "<image><image><image> describe"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            ),
+            imgs=[torch.rand(3, 4, 4) for _ in range(3)],
+        )
+
+        encoded = encoder.encode_sample(sample)
+
+        grid = encoded.visual_tensors["image_grid_thw"]
+        pv = encoded.visual_tensors["pixel_values"]
+        self.assertEqual(tuple(grid.shape), (2, 3), "image_grid_thw should keep the 2 complete images")
+        expected_patches = int(grid[:, 1:].prod(dim=1).sum())  # 2*2 + 3*3 = 13
+        self.assertEqual(expected_patches, 13)
+        self.assertEqual(
+            pv.shape[0],
+            expected_patches,
+            "pixel_values must be sliced to the surviving images' PATCH count, not num_images",
+        )
+
     def test_loss_mask_only_on_assistant(self):
         # Tokens: [10, 11, 12, 13, 14]
         # Assistant answer tokens: [13, 14]  (at positions 3,4)
