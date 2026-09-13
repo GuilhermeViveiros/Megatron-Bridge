@@ -3,7 +3,7 @@
 #SBATCH --job-name=qwen3-eurovl-pa_vect
 #SBATCH --account=e-ext-2025e01-100
 #SBATCH --partition=booster
-#SBATCH --nodes=8
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --time=12:00:00
@@ -15,10 +15,12 @@ set -euo pipefail
 # ── Tunables (env-overridable) ───────────────────────────────────────────
 RECIPE="${RECIPE:-qwen3_euro_vl_pa_sft_config}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-PACK_BUF="${PACK_BUF:-60}"
-GBS="${GBS:-192}"          # 128 for scaling comparison; recipe default is 512 for real throughput
-SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
-TRAIN_ITERS="${TRAIN_ITERS:-4000}"
+PACK_BUF="${PACK_BUF:-90}"
+GBS="${GBS:-1024}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
+TRAIN_ITERS="${TRAIN_ITERS:-3720}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-500}"   # was 500 by default
+EVAL_ITERS="${EVAL_ITERS:-64}"
 # Per-run output dir + W&B name — CHANGE THESE ACROSS RUNS (e.g. A/B: pil vs vectorized).
 # SAVE_DIR overrides the recipe's checkpoint.save/load (each run gets its own empty dir so it
 # starts from the pretrained checkpoint, not a stale resume). Leave empty to use the recipe default.
@@ -39,7 +41,7 @@ fi
 
 echo "=== $(date) | job $SLURM_JOB_ID | nodes=$SLURM_JOB_NUM_NODES ($SLURM_JOB_NODELIST) ==="
 echo "expect world_size = 4 * $SLURM_JOB_NUM_NODES = $((4 * SLURM_JOB_NUM_NODES))"
-echo "recipe=$RECIPE workers=$NUM_WORKERS pack_buf=$PACK_BUF gbs=$GBS save_interval=$SAVE_INTERVAL iters=$TRAIN_ITERS"
+echo "recipe=$RECIPE workers=$NUM_WORKERS pack_buf=$PACK_BUF gbs=$GBS save_interval=$SAVE_INTERVAL iters=$TRAIN_ITERS eval_interval=$EVAL_INTERVAL eval_iters=$EVAL_ITERS"
 echo "save_dir=${SAVE_DIR:-<recipe default>} run_name=$RUN_NAME"
 
 # srun-native: no --ntasks / --nproc here — it inherits the header allocation (nodes ×
@@ -56,6 +58,10 @@ srun --gpu-bind=none ./apptainer.sh \
         dataset.num_workers="$NUM_WORKERS" \
         dataset.packing_buffer_size="$PACK_BUF" \
         checkpoint.save_interval="$SAVE_INTERVAL" \
+        validation.eval_interval="$EVAL_INTERVAL" \
+        validation.eval_iters="$EVAL_ITERS" \
+        scheduler.lr_decay_iters="$TRAIN_ITERS" \
+        scheduler.lr_warmup_iters="$((TRAIN_ITERS / 10))" \
         "${EXTRA_ARGS[@]}"
 
 echo "=== $(date) | job $SLURM_JOB_ID done ==="

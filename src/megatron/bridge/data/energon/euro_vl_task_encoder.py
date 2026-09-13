@@ -37,10 +37,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-import av
 import numpy as np
 import torch
-from megatron.energon import Cooker, basic_sample_keys
+from megatron.energon import Cooker, SkipSample, basic_sample_keys
 from megatron.energon.task_encoder.base import stateless
 from PIL import Image
 
@@ -53,14 +52,6 @@ from megatron.bridge.data.energon.task_encoder_utils import IGNORE_INDEX, ChatML
 from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
-
-
-# Many molmo2_cap H.264 clips are lightly corrupt (missing reference frames); libav logs a benign
-# per-frame ERROR for each ("co located POCs unavailable", "Missing reference picture", ...) and
-# keyframe seeking amplifies the volume. These are non-fatal — decoding continues and the frames are
-# usable — so silence libav's own chatter (routed through the "libav" Python logger). Genuine,
-# unrecoverable decode failures still raise ``av.error`` exceptions, which are unaffected.
-logging.getLogger("libav").setLevel(logging.CRITICAL)
 
 
 # Crude-sample extensions to look for, in priority order.
@@ -124,8 +115,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
     def __init__(
         self,
         processor,
-        seq_length: int = 4096,
+        seq_length: int = 8192,
         sqrt_loss_weighting: bool = False,
+        max_num_images: int = 16,
     ) -> None:
         # EuroVLProcessor returns pixel_values + image_grid_thw for images and
         # pixel_values_videos + video_grid_thw for videos; capture all four so
@@ -134,7 +126,17 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             processor=processor,
             seq_length=seq_length,
             visual_keys=("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"),
+            skip_on_truncation=True,
         )
+        # Cheap pre-filter for multi-image samples: dropped before any image is decoded.
+        # Doesn't guarantee a sample fits seq_length on its own (per-image token cost varies a
+        # lot across datasets) -- that's what skip_on_truncation (above) enforces exactly, using
+        # real computed lengths. This just rejects pathological image counts early. 16 was
+        # picked from a census of every real multi-image dataset in mixture.yaml: the count-based
+        # tail is concentrated exactly at/above this threshold on the ~10 highest-image-count
+        # datasets (e.g. doc/leopard_mpdocvqa avg_n=11.3, max_n=40; doc/doc750k avg_n=13.9,
+        # max_n=63), while every other dataset's images stay well under it.
+        self.max_num_images = max_num_images
         # Square-root per-token loss reweighting (InternVL3.5 eq. 2). When True, each
         # supervised token's loss_mask weight is 1/sqrt(N) (N = supervised tokens in the
         # sample) instead of 1, so a sample's gradient scales with sqrt(N) rather than N.
@@ -145,33 +147,6 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         # Register the cooker that decodes a crude sample into a ChatMLSample. A bound
         # method is picklable (the encoder itself is sent to dataloader workers).
         self.cookers = [Cooker(cook=self._cook)]
-
-    @property
-    def _video_num_frames(self) -> int:
-        """Frames to sample per video — the single source of truth is the processor's video
-        processor (``num_frames``), which the processor itself re-samples to; reading it here
-        keeps decode and processor in lockstep. Raises if the processor is not configured for
-        video (no ``video_processor.num_frames``), since a video sample then cannot be encoded.
-        """
-        vp = getattr(self.processor, "video_processor", None)
-        n = getattr(vp, "num_frames", None) if vp is not None else None
-        if n is None:
-            raise ValueError(
-                "A video sample was encountered but the processor is not configured for video "
-                "(no video_processor.num_frames). Build the processor with num_frames set."
-            )
-        return int(n)
-
-    def _sample_frame_indices(self, total: int) -> list[int]:
-        """``_video_num_frames`` uniformly-spaced frame indices in ``[0, total)`` (sorted, deduped).
-
-        Same ``np.linspace`` idiom as ``MoonViTVideoProcessor._sample_frames`` — feeding the
-        processor exactly ``n`` frames is then an identity re-sample.
-        """
-        n = self._video_num_frames
-        if n >= total:
-            return list(range(total))
-        return sorted(set(np.linspace(0, total - 1, n).round().astype(int).tolist()))
 
     @staticmethod
     def _frame_to_pil(f) -> Image.Image:
@@ -188,16 +163,25 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         return Image.fromarray(f).convert("RGB")
 
     def _frames_from_video(self, v) -> tuple[list[Image.Image], Optional[list[float]]]:
-        """Sample ``_video_num_frames`` PIL frames from whatever form the crude sample carries.
+        """Sample the policy-planned number of PIL frames from whatever form the crude sample
+        carries. The actual decode + frame-count planning lives on ``video_processor``
+        (``decode_video_bytes`` / ``sample_frame_indices``) so the processor stays self-contained
+        for HF export; this method only handles ENERGON-specific frame-type dispatch.
 
         Energon auto-decodes ``.mp4`` into ``megatron.energon.av.video_data.VideoData`` whose
         ``.frames`` is a ``[T, C, H, W]`` uint8 tensor, so most video items arrive already
-        decoded; raw bytes (auto-decode off) go through the memory-bounded PyAV path instead.
-        Also handles a torchvision ``(vframes[T,H,W,C], …)`` tuple, a bare frame tensor, or a
-        list of per-frame PIL/tensor images.
+        decoded; raw bytes (auto-decode off) go through the video processor's memory-bounded
+        PyAV path instead. Also handles a torchvision ``(vframes[T,H,W,C], …)`` tuple, a bare
+        frame tensor, or a list of per-frame PIL/tensor images.
         """
+        vp = getattr(self.processor, "video_processor", None)
+        if vp is None:
+            raise ValueError(
+                "A video sample was encountered but the processor is not configured for video "
+                "(no video_processor). Build the processor with video support."
+            )
         if isinstance(v, (bytes, bytearray)):
-            return self._decode_video_bytes(v)
+            return vp.decode_video_bytes(v)
         # energon VideoData -> .frames [T,C,H,W]; torchvision -> .vframes / tuple[0] [T,H,W,C].
         frames = getattr(v, "frames", None)
         if frames is None:
@@ -216,87 +200,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         fps = getattr(v, "fps", None) or getattr(v, "frame_rate", None)
         if fps is None:
             raise ValueError("auto-decoded video has no fps for timestamps; use auto_decode=False")
-        idxs = self._sample_frame_indices(total)
+        duration = total / float(fps)
+        idxs = vp.sample_frame_indices(duration, total)
         return [self._frame_to_pil(frames[i]) for i in idxs], [i / float(fps) for i in idxs]
-
-    def _decode_video_bytes(self, video_bytes: bytes) -> tuple[list[Image.Image], Optional[list[float]]]:
-        """Decode ``_video_num_frames`` PIL frames + their timestamps (seconds) via keyframe SEEKING.
-
-        For each target timestamp it seeks to the nearest keyframe ``<= t`` and decodes only
-        forward to the frame at ``t`` — instead of walking the whole clip. On real molmo2_cap
-        clips this cut the decode **tail** ~90x (a 380 MB clip: ~17 s -> ~0.2 s), which is what
-        removes the multi-rank dataloader stragglers that stalled training. It keys off the
-        stream/container **duration** (no frame-count pass), so the odd H.264 clips that lack
-        frame metadata are no longer decoded end-to-end just to count. Peak memory is O(n).
-
-        Same library as before (PyAV / ``av``) — only the access pattern changed (seek vs
-        sequential). Falls back to :meth:`_decode_video_bytes_sequential` for the rare clip that
-        exposes no duration. Used when video arrives as raw bytes (energon auto-decode off).
-        """
-        n = self._video_num_frames
-        frames: list[Optional[Image.Image]] = []
-        with av.open(io.BytesIO(video_bytes)) as container:
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
-            if stream.duration is not None and stream.time_base is not None:
-                duration = float(stream.duration * stream.time_base)
-            elif container.duration is not None:
-                duration = float(container.duration) / 1_000_000.0  # AV_TIME_BASE (microseconds)
-            else:
-                duration = 0.0
-            if duration <= 0:
-                return self._decode_video_bytes_sequential(video_bytes)
-
-            # Uniformly-spaced target times across the clip (frame-accurate: decode fwd to >= t).
-            times = [duration / 2.0] if n == 1 else [i * duration / (n - 1) for i in range(n)]
-            last: Optional[Image.Image] = None
-            for t in times:
-                container.seek(int(t / stream.time_base), stream=stream, backward=True, any_frame=False)
-                picked: Optional[Image.Image] = None
-                for frame in container.decode(stream):
-                    last = frame.to_image().convert("RGB")
-                    if frame.time is not None and frame.time >= t - 1e-3:
-                        picked = last
-                        break
-                # Guarantee exactly n frames: if the seek overshot the end, reuse the last frame.
-                frames.append(picked if picked is not None else last)
-
-        if not frames or any(f is None for f in frames):
-            raise ValueError("no frames decoded from video bytes")
-        return frames, times  # type: ignore[return-value]
-
-    def _decode_video_bytes_sequential(self, video_bytes: bytes) -> tuple[list[Image.Image], Optional[list[float]]]:
-        """Fallback for clips with no duration metadata: bounded sequential decode (timestamps from frame.time)."""
-
-        with av.open(io.BytesIO(video_bytes)) as container:
-            stream = container.streams.video[0]
-            total = int(stream.frames or 0)
-            if total <= 0 and stream.duration is not None and stream.average_rate:
-                total = int(float(stream.duration * stream.time_base) * float(stream.average_rate))
-        if total <= 0:
-            with av.open(io.BytesIO(video_bytes)) as container:
-                stream = container.streams.video[0]
-                stream.thread_type = "AUTO"
-                total = sum(1 for _ in container.decode(stream))
-        if total <= 0:
-            raise ValueError("no frames decoded from video bytes")
-
-        targets = set(self._sample_frame_indices(total))
-        frames: list[Image.Image] = []
-        timestamps: list[float] = []
-        with av.open(io.BytesIO(video_bytes)) as container:
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
-            fps = float(stream.average_rate) if stream.average_rate else 0.0
-            for i, frame in enumerate(container.decode(stream)):
-                if i in targets:
-                    frames.append(frame.to_image().convert("RGB"))
-                    timestamps.append(float(frame.time) if frame.time is not None else (i / fps if fps else 0.0))
-                    if len(frames) >= len(targets):
-                        break
-        if not frames:
-            raise ValueError("no frames decoded from video bytes")
-        return frames, timestamps
 
     def _cook(self, sample: dict) -> ChatMLSample:
         """Decode a crude sample (``jpg``/``mp4`` + ``json`` conversation) into a :class:`ChatMLSample`.
@@ -305,9 +211,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         into a parsed object, so we pass those through: ``HFEncoderVLMTaskEncoder``
         converts image/video tensors to PIL (``_images_to_pil`` / ``_videos_to_pil``) and
         ``cook_chatml_sample`` parses the conversation. Raw-bytes inputs are handled too, in
-        case a different energon decode config is used. A sample may carry images, videos, or
-        both (at least one is required); images/videos line up positionally with the
-        conversation's leading ``<image>`` / ``<video>`` tokens.
+        case a different energon decode config is used. A sample may carry images, videos,
+        both, or neither (text-only, e.g. ``text/*/euroblocks``); images/videos line up
+        positionally with the conversation's leading ``<image>`` / ``<video>`` tokens.
         """
         # Multi-image sample: one or more `img{i}.<ext>` parts, sorted by index so they line
         # up positionally with the conversation's leading `<image>` tokens. Falls through to
@@ -319,7 +225,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         imgs: Optional[list] = None
         if multi_image_matches:
             imgs = [sample[k] for _, k in multi_image_matches]
-            imgs = [Image.open(io.BytesIO(im)).convert("RGB") if isinstance(im, (bytes, bytearray)) else im for im in imgs]
+            imgs = [
+                Image.open(io.BytesIO(im)).convert("RGB") if isinstance(im, (bytes, bytearray)) else im for im in imgs
+            ]
         else:
             raw_img = _crude_get(sample, _IMAGE_EXTS)
             if raw_img is not None:
@@ -327,6 +235,15 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
                 if isinstance(raw_img, (bytes, bytearray)):
                     raw_img = Image.open(io.BytesIO(raw_img)).convert("RGB")
                 imgs = [raw_img]
+
+        if imgs is not None and len(imgs) > self.max_num_images:
+            logging.warning(
+                "Skipping sample %s: %d images exceeds max_num_images=%d",
+                sample.get("__key__", "<unknown>"),
+                len(imgs),
+                self.max_num_images,
+            )
+            raise SkipSample()
 
         # Multi-video sample: `vid{i}.<ext>` parts (positional with `<video>` tokens); else a
         # single bare `mp4` part. Each is decoded to a list of frames; None when no video part.
@@ -346,12 +263,8 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             videos = [frames for frames, _ in decoded]
             video_metadata = [{"timestamps": ts} for _, ts in decoded]
 
-        if imgs is None and videos is None:
-            raise KeyError(
-                f"crude sample has no image or video (looked for {_IMAGE_EXTS} / {_VIDEO_EXTS}); "
-                f"keys={list(sample.keys())}"
-            )
-
+        # Text-only samples (e.g. text/*/euroblocks) carry no image/video part at all --
+        # imgs/videos stay None and flow through to a text-only ChatMLSample.
         raw_conv = _crude_get(sample, _CONVERSATION_EXTS)
         if raw_conv is None:
             raise KeyError(

@@ -38,6 +38,11 @@ ENV_ARGS=(
     #   export WANDB_API_KEY=<your-key>   before running this script.
     --env "WANDB_API_KEY=${WANDB_API_KEY:-}"
     --env "WANDB_MODE=${WANDB_MODE:-offline}"
+    # Compute nodes on this cluster have no outbound network access (only the login node
+    # does) — set HF_HUB_OFFLINE=1 before running this script on a compute node to force
+    # huggingface_hub to use the local cache only, instead of failing on the metadata
+    # HEAD request it normally makes even for already-cached files.
+    --env "HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-}"
 )
 
 BINDS=(

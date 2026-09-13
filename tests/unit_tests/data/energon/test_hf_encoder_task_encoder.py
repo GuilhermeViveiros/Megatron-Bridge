@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import torch
+from megatron.energon import SkipSample
 
 from megatron.bridge.data.energon.hf_encoder_task_encoder import (
     HFEncoderTaskBatch,
@@ -163,7 +164,9 @@ class TestHFEncoderVLMTaskEncoderEncodeSample(unittest.TestCase):
         """
         image_token_id = 99
         # [prefix(3)] [img0 block(3)] [mid(2)] [img1 block(4)] [mid(2)] [img2 block(5)] [suffix(2)]
-        ids = [1, 2, 3] + [image_token_id] * 3 + [4, 5] + [image_token_id] * 4 + [6, 7] + [image_token_id] * 5 + [20, 21]
+        ids = (
+            [1, 2, 3] + [image_token_id] * 3 + [4, 5] + [image_token_id] * 4 + [6, 7] + [image_token_id] * 5 + [20, 21]
+        )
         input_ids = torch.tensor([ids])  # length 21; img2 block spans positions [14, 19)
 
         pixel_values = torch.randn(29, 3, 14, 14)  # 4 + 9 + 16 patches, all 3 images
@@ -207,6 +210,57 @@ class TestHFEncoderVLMTaskEncoderEncodeSample(unittest.TestCase):
             expected_patches,
             "pixel_values must be sliced to the surviving images' PATCH count, not num_images",
         )
+
+    def test_truncates_by_default(self):
+        """skip_on_truncation defaults to False -- other HF-encoder VLMs (Gemma3-VL,
+        Ministral3, GLM-4.5V) keep today's truncate-and-warn behavior unchanged."""
+        image_token_id = 99
+        input_ids = torch.tensor([[1, 2] + [image_token_id] * 3 + [3, 4, 5, 6, 7]])
+        processor = _make_processor(input_ids=input_ids)
+        processor.image_token_id = image_token_id
+        processor.video_token_id = None
+        encoder = HFEncoderVLMTaskEncoder(processor=processor, seq_length=6, visual_keys=("pixel_values",))
+
+        sample = _make_chatml_sample(
+            conversation=json.dumps([{"role": "user", "content": "<image>"}, {"role": "assistant", "content": "ok"}]),
+            imgs=[torch.rand(3, 4, 4)],
+        )
+        encoded = encoder.encode_sample(sample)
+        self.assertEqual(tuple(encoded.input_ids.shape), (6,))
+
+    def test_skips_on_truncation_when_enabled(self):
+        """skip_on_truncation=True raises SkipSample for ANY sample needing truncation,
+        not just ones where vision tokens alone exceed seq_length."""
+        image_token_id = 99
+        input_ids = torch.tensor([[1, 2] + [image_token_id] * 3 + [3, 4, 5, 6, 7]])
+        processor = _make_processor(input_ids=input_ids)
+        processor.image_token_id = image_token_id
+        processor.video_token_id = None
+        encoder = HFEncoderVLMTaskEncoder(
+            processor=processor, seq_length=6, visual_keys=("pixel_values",), skip_on_truncation=True
+        )
+
+        sample = _make_chatml_sample(
+            conversation=json.dumps([{"role": "user", "content": "<image>"}, {"role": "assistant", "content": "ok"}]),
+            imgs=[torch.rand(3, 4, 4)],
+        )
+        with self.assertRaises(SkipSample):
+            encoder.encode_sample(sample)
+
+    def test_no_skip_when_sample_already_fits(self):
+        """skip_on_truncation=True must not raise for a sample that already fits seq_length
+        (no truncation needed)."""
+        input_ids = torch.tensor([[10, 11, 12, 13]])
+        processor = _make_processor(input_ids=input_ids)
+        processor.video_token_id = None
+        encoder = HFEncoderVLMTaskEncoder(
+            processor=processor, seq_length=128, visual_keys=("pixel_values",), skip_on_truncation=True
+        )
+        sample = _make_chatml_sample(
+            conversation=json.dumps([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "ok"}]),
+        )
+        encoded = encoder.encode_sample(sample)
+        self.assertEqual(tuple(encoded.input_ids.shape), (4,))
 
     def test_loss_mask_only_on_assistant(self):
         # Tokens: [10, 11, 12, 13, 14]

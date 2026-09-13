@@ -70,6 +70,8 @@ class TestEnergonProvider:
             micro_batch_size=params["micro_batch_size"],
             global_batch_size=params["global_batch_size"],
             num_workers=params["num_workers"],
+            packing_buffer_size=None,
+            max_samples_per_sequence=None,
             pg_collection=context.pg_collection,
         )
 

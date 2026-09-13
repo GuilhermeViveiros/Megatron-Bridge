@@ -197,7 +197,6 @@ class EuroVLModel(MegatronModule):
         Returns:
             Tuple of (model_output, loss_mask) where loss_mask may be CP-sliced.
         """
-        # import pdb; pdb.set_trace()
         if self.pre_process:
             if inputs_embeds is None:
                 inputs_embeds = self.language_model.embedding(

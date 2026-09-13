@@ -29,7 +29,7 @@ class MoonViTVisionProcessor(MoonViTVideoProcessor, MoonViTImageProcessor):
 
     Combines the image pipeline (:class:`MoonViTImageProcessor`, via ``__call__`` ->
     ``pixel_values`` + ``image_grid_hws``) and the per-frame video pipeline
-    (:class:`MoonViTVideoProcessor`, via ``preprocess_videos`` -> ``pixel_values_videos`` +
+    (:class:`MoonViTVideoProcessor`, via ``vectorized_preprocess`` -> ``pixel_values_videos`` +
     ``video_grid_thw``), so a single instance drives both modalities. The
     :attr:`image_processor` / :attr:`video_processor` views (both ``self``) let a single
     instance be handed to consumers that expect the two separate sub-processors.

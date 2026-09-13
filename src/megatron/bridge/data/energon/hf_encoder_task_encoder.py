@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from megatron.energon import Batch, DefaultTaskEncoder
+from megatron.energon import Batch, DefaultTaskEncoder, SkipSample
 
 from megatron.bridge.data.energon.task_encoder_utils import (
     IGNORE_INDEX,
@@ -80,6 +80,9 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
             "video_grid_thw")`` for GLM-4.5V).
         min_pixels: Optional min pixel constraint forwarded to the processor.
         max_pixels: Optional max pixel constraint forwarded to the processor.
+        skip_on_truncation: When True, raise ``SkipSample`` instead of truncating any sample
+            whose natural length exceeds ``seq_length``. Off by default (existing behavior:
+            truncate and warn); ``EuroVLTaskEncoder`` opts in.
     """
 
     def __init__(
@@ -89,6 +92,7 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         visual_keys: Sequence[str] = ("pixel_values",),
         min_pixels: Optional[int] = None,
         max_pixels: Optional[int] = None,
+        skip_on_truncation: bool = False,
     ):
         super().__init__()
         self.processor = processor
@@ -96,6 +100,12 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         self.visual_keys: Tuple[str, ...] = tuple(visual_keys)
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        # When True, any sample whose natural (pre-truncation) length exceeds seq_length raises
+        # SkipSample instead of truncating -- truncating risks cutting off the answer itself, and
+        # with packing another real sample fills the slot anyway, so skipping costs nothing. Off
+        # by default so existing HF-encoder VLMs (Gemma3-VL, Ministral3, GLM-4.5V) keep their
+        # current truncate-and-warn behavior; EuroVLTaskEncoder opts in.
+        self.skip_on_truncation = skip_on_truncation
 
     # ------------------------------------------------------------------
     # Helpers
@@ -245,8 +255,23 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         # Also shift loss_mask to align with labels
         loss_mask_np = shifted_loss
 
-        # 7. Truncate
+        # 6b. Skip (rather than truncate) any sample whose natural length exceeds seq_length.
+        #     Truncating risks cutting off the answer itself (e.g. a reasoning chain that
+        #     concludes "Final Answer: D" at the very end) -- with packing filling the slot
+        #     from another real sample either way, skipping costs nothing but avoids teaching
+        #     answerless, truncated completions.
         max_len = self.seq_length
+        if self.skip_on_truncation and len(input_ids_np) > max_len:
+            logging.warning(
+                "Skipping sample %s: pre-truncation length %d exceeds seq_length=%d; "
+                "truncating would risk cutting off the answer.",
+                sample.__key__,
+                len(input_ids_np),
+                max_len,
+            )
+            raise SkipSample()
+
+        # 7. Truncate
         input_ids_pre_trunc = input_ids_np
         input_ids_np = input_ids_np[:max_len].copy()
         labels_np = labels_np[:max_len].copy()

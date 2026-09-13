@@ -104,11 +104,7 @@ class EuroVLEnergonProvider(EnergonProvider):
         if not self.root:
             raise ValueError("EuroVLEnergonProvider.root must be set (the energon-data directory).")
         root_abs = os.path.abspath(self.root)
-        paths = [
-            os.path.abspath(dirpath)
-            for dirpath, dirnames, _ in os.walk(self.root)
-            if ".nv-meta" in dirnames
-        ]
+        paths = [os.path.abspath(dirpath) for dirpath, dirnames, _ in os.walk(self.root) if ".nv-meta" in dirnames]
         if not paths:
             raise ValueError(f"No prepared energon datasets (.nv-meta) found under {self.root}.")
 
@@ -181,15 +177,41 @@ class EuroVLEnergonProvider(EnergonProvider):
 
         A mapping value is a category group (recurse); a numeric value is a repeat factor
         for that key (a dataset name or a category prefix).
+
+        Mirrors ``_discover_datasets``'s own disambiguation: the SAME leaf name can
+        legitimately appear more than once nested under different category paths (e.g.
+        ``image.doc.docmatix`` and ``multiimage.doc.docmatix`` are two different on-disk
+        datasets that happen to share a base name). Flattening by bare leaf name alone would
+        silently drop one of the two (dict overwrite) and, even if it didn't, the surviving
+        bare key would no longer match anything once ``_discover_datasets`` has renamed both
+        colliding directories to their full ``modality_category_name`` form. So: collect every
+        leaf first, then only the leaves whose bare name is NOT unique get rewritten to that
+        same underscore-joined full-path form; unique leaves stay bare (matching the existing,
+        already-referenced-by-plain-name mixtures).
         """
+
+        def _collect(node, path: tuple[str, ...]) -> list[tuple[tuple[str, ...], str, float]]:
+            if not isinstance(node, dict):
+                raise ValueError("mixture_file must contain a mapping (optionally nested by category).")
+            leaves = []
+            for key, val in node.items():
+                if isinstance(val, dict):
+                    leaves.extend(_collect(val, path + (str(key),)))
+                else:
+                    leaves.append((path, str(key), float(val)))
+            return leaves
+
+        leaves = _collect(data, ())
+        leaf_counts: dict[str, int] = {}
+        for _, key, _ in leaves:
+            leaf_counts[key] = leaf_counts.get(key, 0) + 1
+
         flat: dict[str, float] = {}
-        if not isinstance(data, dict):
-            raise ValueError("mixture_file must contain a mapping (optionally nested by category).")
-        for key, val in data.items():
-            if isinstance(val, dict):
-                flat.update(EuroVLEnergonProvider._flatten_mixture_yaml(val))
-            else:
-                flat[str(key)] = float(val)
+        for path, key, r in leaves:
+            name = "_".join((*path, key)) if leaf_counts[key] > 1 else key
+            if name in flat:
+                raise ValueError(f"Duplicate mixture key {name!r} even after path disambiguation.")
+            flat[name] = r
         return flat
 
     def _resolve_repeat_factors(self, datasets: dict[str, str]) -> dict[str, float]:
@@ -329,11 +351,9 @@ class EuroVLEnergonProvider(EnergonProvider):
         # table is identical, so avoid N duplicate copies in the launch log.
         if int(os.environ.get("RANK", "0")) == 0:
             logger.info(
-                _BLUE
-                + "EuroVL blend (InternVL repeat factors): %d dataset(s) in %d categor(ies), "
+                _BLUE + "EuroVL blend (InternVL repeat factors): %d dataset(s) in %d categor(ies), "
                 "total_train_samples=%d, total_eff=%.0f -> %s\n%s\n"
-                "By dataset (size = TRAIN-split samples):\n%s\nBy category:\n%s"
-                + _RESET,
+                "By dataset (size = TRAIN-split samples):\n%s\nBy category:\n%s" + _RESET,
                 len(blend),
                 len(cat),
                 int(total_size),

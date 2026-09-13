@@ -9,9 +9,17 @@ real per-frame timestamp text) before running at scale — see
 `assets/token_census/scripts/validate_token_estimates.py`.
 
 Organized by real dataset category (matching `mixture.yaml`'s taxonomy), and within each
-category by modality (image / multiimage / video / text). There are currently no text-only
-(zero-vision) datasets in this census — the "text" subsection is always empty, kept explicit
-rather than dropped so a future text-only addition has an obvious home.
+category by modality (image / multiimage / video / text). Text-only (zero-vision) samples are
+tokenized the same way minus the image/video expansion step — no pixel decode is needed there
+either, since there's nothing to decode.
+
+Text-only samples also get a placeholder-sanitization pass (`_sanitize_text_only_placeholders`
+in `estimate_token_budget.py`) before tokenizing: some text corpora (found 2026-09-12 in
+`code/euroblocks`, a Codeforces-style competitive-programming source) retain a literal `<image>`
+placeholder from their original source even though this text-only dataset carries no actual
+image file. Left as-is, that tokenizes to the same id as a real vision slot (confirmed against
+the live tokenizer) — a real training-time hazard the actual text-SFT encoder path needs its own
+fix for, independent of this census script's sanitization.
 
 Regenerate the raw census: `./apptainer.sh uv run --no-sync python assets/token_census/scripts/estimate_token_budget.py --categories <cats> --workers 16`
 (use 16, not 64 — 64 concurrent worker imports exhausted file descriptors on this filesystem).
@@ -19,38 +27,43 @@ Regenerate this file from existing raw results: `uv run --no-sync python assets/
 
 ## Overall total
 
-**276 datasets censused, 99,461,938 samples, 103.89B tokens (r=1, one epoch each).**
+**286 datasets censused, 113,653,258 samples, 121.28B tokens (r=1, one epoch each).**
 
-Note: as of this generation, 9 real datasets discovered on disk are NOT yet in this census
-(`leopard_arxiv_enriched_translated`, `doc750k`, `docmatix`, `leopard_dude`, `leopard_monkey`,
-`leopard_mpdocvqa`, `molmo2_doc` — some appear under both `image` and `multiimage`) — either
-missing `.nv-meta` energon indexing or added/renamed after the last census run. A handful of
+Note: `doc750k` (both `image` and `multiimage` variants) and `webmmu` are censused but
+deliberately excluded from this file and from `mixture.yaml`. `doc750k`: a 60-sample audit found
+0% of its follow-up questions reference anything visual (the full paper text is given in the
+prompt alongside the page images, so every question is answerable from that text alone).
+`webmmu`: avg 59,280 text tokens/sample (full original + full rewritten HTML/CSS/JS file, one
+sample alone ~938k characters) is too long-context for this training phase, and only ~28% of its
+edit instructions describe a visual defect the code text alone doesn't reveal. A handful of
 `_buggy_backup`/`_preshuffle_backup` directories also exist on disk and are intentionally excluded
 (not real additional data).
 
 | category | tokens (r=1) |
 |---|---|
-| code | 28.45B |
+| code | 31.64B |
+| chart | 14.29B |
 | ocr | 13.81B |
 | captioning | 13.40B |
-| chart | 11.71B |
 | general_qa | 8.81B |
+| doc | 8.51B |
 | knowledge | 5.74B |
 | pointing | 5.05B |
 | grounding | 4.79B |
 | counting | 4.31B |
-| doc | 3.91B |
+| chat | 3.67B |
 | gui | 2.66B |
-| math | 509.39M |
+| math | 2.33B |
+| stem | 1.53B |
 | medical | 357.10M |
 | 3d_grounding | 297.10M |
 | science | 62.79M |
 | spatial | 26.59M |
-| **TOTAL** | **103.89B** |
+| **TOTAL** | **121.28B** |
 
 # image
 
-236 dataset(s), 93,840,310 samples, **82.74B tokens (r=1)**.
+237 dataset(s), 96,471,448 samples, **85.92B tokens (r=1)**.
 
 ## 3d_grounding
 
@@ -84,11 +97,12 @@ Raw per-shard data: `assets/token_census/results/*/image__captioning__<name>/*.j
 
 ## chart
 
-35 dataset(s), 8.61B tokens.
+36 dataset(s), 11.19B tokens.
 
 | dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
 |---|---|---|---|---|---|---|---|---|
 | chartnet_summary | 2,513,168 | 979 | 487 | 2.46B | 1.22B | 1744 | 1185 | 1.49 |
+| leopard_arxiv_enriched_translated | 2,068,959 | 1032 | 216 | 2.13B | 447.20M | 1803 | 1273 | 1.72 |
 | caul_plotqa | 1,089,485 | 956 | 1019 | 1.04B | 1.11B | 1106 | 683 | 1.62 |
 | fv_unichart | 727,728 | 667 | 540 | 485.61M | 392.90M | 894 | 552 | 1.66 |
 | fv_synthchartnet | 500,000 | 573 | 160 | 286.66M | 79.87M | 772 | 591 | 1.37 |
@@ -128,7 +142,7 @@ Raw per-shard data: `assets/token_census/results/*/image__chart__<name>/*.json`
 
 ## code
 
-12 dataset(s), 28.45B tokens.
+11 dataset(s), 28.20B tokens.
 
 | dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
 |---|---|---|---|---|---|---|---|---|
@@ -138,7 +152,6 @@ Raw per-shard data: `assets/token_census/results/*/image__chart__<name>/*.json`
 | chartmoe_chart2code | 898,609 | 823 | 838 | 739.40M | 752.68M | 1064 | 578 | 1.82 |
 | web2code_new | 806,710 | 1069 | 578 | 862.40M | 466.65M | 1322 | 882 | 1.60 |
 | mmc_instruct | 168,106 | 784 | 837 | 131.87M | 140.66M | 632 | 1326 | 0.62 |
-| webmmu | 4,088 | 1071 | 59280 | 4.38M | 242.34M | 1490 | 1554 | 0.95 |
 | datik | 220,183 | 225 | 498 | 49.54M | 109.56M | 420 | 420 | 1.00 |
 | datikz | 47,441 | 144 | 801 | 6.83M | 37.99M | 336 | 336 | 1.00 |
 | chartmimic | 4,800 | 942 | 1280 | 4.52M | 6.14M | 1124 | 782 | 1.53 |
@@ -163,10 +176,11 @@ Raw per-shard data: `assets/token_census/results/*/image__counting__<name>/*.jso
 
 ## doc
 
-17 dataset(s), 932.54M tokens.
+18 dataset(s), 1.78B tokens.
 
 | dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
 |---|---|---|---|---|---|---|---|---|
+| docmatix | 566,267 | 1069 | 435 | 605.46M | 246.07M | 1506 | 1782 | 0.86 |
 | bigdocs_pubtables_1m | 345,989 | 396 | 978 | 137.10M | 338.21M | 614 | 526 | 1.63 |
 | bigdocs_arxiv_ocr | 110,854 | 1068 | 494 | 118.36M | 54.73M | 1680 | 2226 | 0.76 |
 | docreason51k | 51,726 | 919 | 124 | 47.53M | 6.42M | 1603 | 1973 | 1.48 |
@@ -434,7 +448,7 @@ Raw per-shard data: `assets/token_census/results/*/image__spatial__<name>/*.json
 
 # multiimage
 
-39 dataset(s), 5,530,466 samples, **20.48B tokens (r=1)**.
+44 dataset(s), 6,442,424 samples, **24.23B tokens (r=1)**.
 
 ## 3d_grounding
 
@@ -486,11 +500,16 @@ Raw per-shard data: `assets/token_census/results/*/multiimage__counting__<name>/
 
 ## doc
 
-1 dataset(s), 2.98B tokens.
+6 dataset(s), 6.73B tokens.
 
 | dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
 |---|---|---|---|---|---|---|---|---|
 | molmo2_doc_translated | 391,195 | 7027 | 596 | 2.75B | 233.13M | 1601 | 1793 | 0.99 |
+| docmatix | 716,889 | 2890 | 556 | 2.07B | 398.47M | 1344 | 1653 | 0.83 |
+| leopard_mpdocvqa | 43,778 | 11314 | 143 | 495.31M | 6.28M | 1811 | 2148 | 0.88 |
+| molmo2_doc | 54,717 | 7053 | 492 | 385.92M | 26.90M | 1600 | 1791 | 0.99 |
+| leopard_dude | 34,500 | 7943 | 74 | 274.04M | 2.56M | 1727 | 2168 | 0.81 |
+| leopard_monkey | 62,074 | 1233 | 175 | 76.54M | 10.88M | 656 | 764 | 1.05 |
 
 Raw per-shard data: `assets/token_census/results/*/multiimage__doc__<name>/*.json`
 
@@ -608,4 +627,44 @@ Raw per-shard data: `assets/token_census/results/*/video__captioning__<name>/*.j
 
 # text
 
-No text-only (zero-vision) datasets in this census yet.
+4 dataset(s), 10,648,224 samples, **10.45B tokens (r=1)**.
+
+## chat
+
+1 dataset(s), 3.67B tokens.
+
+| dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
+|---|---|---|---|---|---|---|---|---|
+| euroblocks | 3,937,955 | 0 | 932 | 0 | 3.67B | - | - | - |
+
+Raw per-shard data: `assets/token_census/results/*/text__chat__<name>/*.json`
+
+## code
+
+1 dataset(s), 3.44B tokens.
+
+| dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
+|---|---|---|---|---|---|---|---|---|
+| euroblocks | 2,071,395 | 0 | 1660 | 0 | 3.44B | - | - | - |
+
+Raw per-shard data: `assets/token_census/results/*/text__code__<name>/*.json`
+
+## math
+
+1 dataset(s), 1.82B tokens.
+
+| dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
+|---|---|---|---|---|---|---|---|---|
+| euroblocks | 2,283,874 | 0 | 796 | 0 | 1.82B | - | - | - |
+
+Raw per-shard data: `assets/token_census/results/*/text__math__<name>/*.json`
+
+## stem
+
+1 dataset(s), 1.53B tokens.
+
+| dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |
+|---|---|---|---|---|---|---|---|---|
+| euroblocks | 2,355,000 | 0 | 648 | 0 | 1.53B | - | - | - |
+
+Raw per-shard data: `assets/token_census/results/*/text__stem__<name>/*.json`

@@ -15,18 +15,79 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-from megatron.core.models.gpt import GPTModel as MCoreGPTModel
-
-from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel
 from megatron.bridge.models.gpt_provider import GPTModelProvider
+
+
+def _build_mrope_gpt_model(
+    provider: "Any",
+    pre_process: Optional[bool],
+    post_process: Optional[bool],
+    vp_stage: Optional[int],
+    patch_qk_norm: bool,
+) -> "Any":
+    """Build Qwen3-VL's interleaved-M-RoPE ``Qwen3VLGPTModel`` as a language backbone.
+
+    Shared by every EuroVL M-RoPE provider (Qwen3, EuroLLM, ...) — ``Qwen3VLGPTModel`` and
+    ``Qwen3VLSelfAttention`` are already config-driven (mrope_section, rotary_base,
+    qk_layernorm all come from ``provider``), so no per-backbone subclassing of the model
+    itself is needed, only different config values and whether QK-norm must be patched in.
+
+    ``patch_qk_norm`` selects the attention variant: True (Qwen3) swaps in
+    ``Qwen3VLSelfAttention`` for its q_norm/k_norm weights; False (e.g. EuroLLM, which has
+    none) leaves the base dense spec's plain ``SelfAttention`` — verified empirically to
+    produce the exact same parameter names either way when ``qk_layernorm=False``.
+    """
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_block_with_experimental_attention_variant_spec,
+    )
+
+    assert provider.mrope_section is not None, f"{type(provider).__name__} requires mrope_section"
+
+    block_spec = get_transformer_block_with_experimental_attention_variant_spec(provider, vp_stage=vp_stage)
+    if patch_qk_norm:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
+        from megatron.bridge.models.qwen_vl.qwen35_vl_provider import _patch_standard_attention_specs
+
+        _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
+
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
+
+    return Qwen3VLGPTModel(
+        config=provider,
+        transformer_layer_spec=block_spec,
+        vocab_size=provider.vocab_size,
+        max_sequence_length=provider.seq_length,
+        pre_process=True if pre_process is None else pre_process,
+        post_process=True if post_process is None else post_process,
+        position_embedding_type="mrope",
+        rotary_percent=provider.rotary_percent,
+        rotary_base=provider.rotary_base,
+        share_embeddings_and_output_weights=provider.share_embeddings_and_output_weights,
+        pg_collection=provider._pg_collection,
+        vp_stage=vp_stage,
+    )
 
 
 @dataclass
 class EuroVLModelProvider(GPTModelProvider):
-    """Model provider for EuroVL (MoonViT + EuroLLM).
+    """Model provider for EuroVL (MoonViT + EuroLLM), on an interleaved-M-RoPE ``Qwen3VLGPTModel``
+    backbone.
 
-    Inherits all standard GPT/LLM fields from GPTModelProvider.
-    VLM-specific fields are defined below.
+    Inherits all standard GPT/LLM fields from GPTModelProvider. VLM-specific fields are defined
+    below. ``qk_layernorm=False``: EuroLLM has no QK-norm weights to load (Qwen3VLSelfAttention
+    only allocates q/k_layernorm submodules when ``config.qk_layernorm`` is set — see
+    ``megatron.core.transformer.attention.SelfAttention.__init__``), which makes
+    ``_build_mrope_gpt_model``'s ``patch_qk_norm=False`` path produce the exact same
+    15-parameter-name Megatron module a plain 1D ``GPTModel`` would (verified empirically) --
+    so an EuroVL checkpoint imported before M-RoPE loads in unmodified; no new HF assembly or
+    bridge-dispatch change is needed.
+
+    ``mrope_section=[24, 20, 20]`` sums to 64 = ``head_dim // 2`` (EuroLLM-1.7B's ``head_dim``
+    is 128).
+
+    HF-side generation is NOT wired: ``Qwen3VLTextModel`` unconditionally allocates
+    ``q_norm``/``k_norm`` (verified: not gated on any config flag), so it cannot represent this
+    Llama backbone as-is. That only blocks HF export/inference, not Megatron training.
     """
 
     # VLMs must not scatter embeddings across SP regions because image token
@@ -45,11 +106,11 @@ class EuroVLModelProvider(GPTModelProvider):
 
     # Vision special tokens appended to EuroLLM's vocabulary (base vocab_size=128000).
     # Vocab is padded to the next multiple of 128 → 128128.
-    image_token_id: int = 128000        # <image>           — per-image-token placeholder
+    image_token_id: int = 128000  # <image>           — per-image-token placeholder
     vision_start_token_id: int = 128001  # <|vision_start|>  — block start delimiter
-    vision_end_token_id: int = 128002    # <|vision_end|>    — block end delimiter
-    vision_pad_token_id: int = 128003    # <|vision_pad|>    — vision sequence padding
-    video_token_id: int = 128004         # <video>           — per-video-frame placeholder
+    vision_end_token_id: int = 128002  # <|vision_end|>    — block end delimiter
+    vision_pad_token_id: int = 128003  # <|vision_pad|>    — vision sequence padding
+    video_token_id: int = 128004  # <video>           — per-video-frame placeholder
 
     # Attention strategy for image token positions in the LLM decoder.
     # False (default): pure causal masking — simplest baseline.
@@ -61,16 +122,31 @@ class EuroVLModelProvider(GPTModelProvider):
     freeze_vision_model: bool = False
     freeze_vision_projection: bool = False
 
+    # Interleaved M-RoPE channel split across (t, h, w); must sum to head_dim // 2.
+    mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
+    # Interleaved mrope is applied by Qwen3VLMultimodalRotaryEmbedding, NOT the fused kernel.
+    position_embedding_type: str = "mrope"
+    apply_rope_fusion: bool = False
+    # Text-path config fields the reused Qwen3VLGPTModel/rope/attention read but that are
+    # absent from the base GPTModelProvider:
+    #   - apply_rotary_pos_emb_in_fp32: LLM rope stays bf16; only the vision tower uses fp32.
+    #   - deepstack_visual_indexes: layers where multi-level vision features get injected. We
+    #     run deepstack-OFF (MoonViT single-point masked_scatter), so no injection layers.
+    apply_rotary_pos_emb_in_fp32: bool = False
+    deepstack_visual_indexes: List[int] = field(default_factory=list)
+    # EuroLLM has no QK-norm weights (see class docstring).
+    qk_layernorm: bool = False
+
     def provide(
         self,
         pre_process: Optional[bool] = None,
         post_process: Optional[bool] = None,
         vp_stage: Optional[int] = None,
-    ) -> EuroVLModel:
-        """Instantiate the full EuroVL model and apply freeze flags."""
-        model = EuroVLModel(
-            self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
-        )
+    ) -> "Any":
+        """Instantiate the full EuroVL+M-RoPE model and apply freeze flags."""
+        from megatron.bridge.models.euro_vl.modeling_euro_vl import Qwen3EuroVLModel
+
+        model = Qwen3EuroVLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
                 freeze_language_model=self.freeze_language_model,
@@ -84,26 +160,29 @@ class EuroVLModelProvider(GPTModelProvider):
         pre_process: Optional[bool] = None,
         post_process: Optional[bool] = None,
         vp_stage: Optional[int] = None,
-    ) -> MCoreGPTModel:
-        """Instantiate the EuroLLM decoder only (used by pipeline-parallel stages)."""
-        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+    ) -> "Any":
+        """Build the M-RoPE ``Qwen3VLGPTModel`` over EuroLLM's architecture fields.
+
+        No QK-norm patch: EuroLLM has none, and with ``qk_layernorm=False`` the base dense
+        spec's plain ``SelfAttention`` already matches what ``Qwen3VLSelfAttention`` would
+        produce (see class docstring).
+        """
+        assert not self.qk_layernorm, "EuroLLM has no QK-norm weights; qk_layernorm must be False"
+        return _build_mrope_gpt_model(self, pre_process, post_process, vp_stage, patch_qk_norm=False)
 
 
 @dataclass
 class Qwen3EuroVLModelProvider(EuroVLModelProvider):
-    """Provider for :class:`Qwen3EuroVLModel` — MoonViT + projector on a Qwen3-VL M-RoPE LLM.
+    """Provider for :class:`Qwen3EuroVLModel` — MoonViT + projector on a Qwen3-1.7B M-RoPE LLM.
 
-    Validation / oracle variant (see ``current.md``): swaps EuroVL's stock 1D-RoPE ``GPTModel``
-    backbone for Qwen3-VL's proven **interleaved-M-RoPE** ``Qwen3VLGPTModel``. Point the standard
-    architecture fields (``num_layers``, ``hidden_size``, ``vocab_size``, ``rotary_base``, …) at
-    Qwen3 to mirror Qwen3-VL (or at EuroLLM later — same stack, different config).
+    Validation / oracle variant (see ``current.md``): points the standard architecture fields
+    (``num_layers``, ``hidden_size``, ``vocab_size``, ``rotary_base``, …) at Qwen3-1.7B, and
+    enables QK-norm (``qk_layernorm=True``), which Qwen3 has and the base provider's backbone
+    does not.
 
-    Key mrope config (overridden here): ``position_embedding_type='mrope'``, ``apply_rope_fusion``
-    disabled (the fused RoPE kernel cannot do interleaved mrope), and ``mrope_section`` (channel
-    split across t/h/w, must sum to ``head_dim // 2``).
-
-    TODO: confirm ``get_transformer_block_with_experimental_attention_variant_spec`` yields a plain
-    dense spec for this config; verify weight loading (Qwen3 LLM + MoonViT) and the bridge/recipe.
+    Key mrope config here matches the base provider's (``position_embedding_type='mrope'``,
+    ``apply_rope_fusion`` disabled, ``mrope_section`` channel split across t/h/w summing to
+    ``head_dim // 2``) — only ``qk_layernorm`` and the architecture fields differ.
     """
 
     # Interleaved M-RoPE channel split across (t, h, w); must sum to head_dim // 2 (Qwen3-VL default).
@@ -149,30 +228,4 @@ class Qwen3EuroVLModelProvider(EuroVLModelProvider):
         Reuses Qwen3-VL's spec + attention (``Qwen3VLSelfAttention``) and mrope GPT wholesale so no
         mrope math is reimplemented; deepstack is left off (default ``None`` in the forward).
         """
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            get_transformer_block_with_experimental_attention_variant_spec,
-        )
-
-        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
-        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
-        from megatron.bridge.models.qwen_vl.qwen35_vl_provider import _patch_standard_attention_specs
-
-        assert self.mrope_section is not None, "Qwen3EuroVLModelProvider requires mrope_section"
-
-        block_spec = get_transformer_block_with_experimental_attention_variant_spec(self, vp_stage=vp_stage)
-        _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
-
-        return Qwen3VLGPTModel(
-            config=self,
-            transformer_layer_spec=block_spec,
-            vocab_size=self.vocab_size,
-            max_sequence_length=self.seq_length,
-            pre_process=True if pre_process is None else pre_process,
-            post_process=True if post_process is None else post_process,
-            position_embedding_type="mrope",
-            rotary_percent=self.rotary_percent,
-            rotary_base=self.rotary_base,
-            share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
-            pg_collection=self._pg_collection,
-            vp_stage=vp_stage,
-        )
+        return _build_mrope_gpt_model(self, pre_process, post_process, vp_stage, patch_qk_norm=True)

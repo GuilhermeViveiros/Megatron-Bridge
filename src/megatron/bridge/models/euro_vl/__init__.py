@@ -14,9 +14,19 @@
 
 from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.euro_vl_bridge import EuroVLBridge
-from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
-from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel, EuroVLProjector
 from megatron.bridge.models.euro_vl.euro_vl_processor import EuroVLProcessor
+from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
+
+# Standalone Gemma2-backbone experiment (Tower-Plus-2B). Imported here only so its
+# bridge/AutoConfig registration happens on package import; nothing above depends on it.
+from megatron.bridge.models.euro_vl.gemma_euro_vl_bridge import GemmaEuroVLBridge
+from megatron.bridge.models.euro_vl.gemma_euro_vl_hf import (
+    GemmaEuroVLConfig,
+    GemmaEuroVLForConditionalGeneration,
+    GemmaEuroVLProcessor,
+)
+from megatron.bridge.models.euro_vl.gemma_euro_vl_provider import GemmaEuroVLModelProvider
+from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel, EuroVLProjector
 from megatron.bridge.models.euro_vl.modeling_euro_vl_hf import (
     EuroVLForConditionalGeneration,
     EuroVLMultiModalProjector,
@@ -33,5 +43,10 @@ __all__ = [
     "EuroVLMultiModalProjector",
     "EuroVLProcessor",
     "EuroVLProjector",
+    "GemmaEuroVLBridge",
+    "GemmaEuroVLConfig",
+    "GemmaEuroVLForConditionalGeneration",
+    "GemmaEuroVLModelProvider",
+    "GemmaEuroVLProcessor",
     "compute_moonvit_visual_tokens",
 ]

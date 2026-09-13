@@ -256,7 +256,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
         if position_ids is None:
             position_ids = self._compute_position_ids(
-                input_ids, inputs_embeds, image_grid_thw, video_grid_thw, past_key_values
+                input_ids, inputs_embeds, image_grid_thw, video_grid_thw, past_key_values, attention_mask
             )
 
         return self.language_model(
@@ -276,6 +276,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         image_grid_thw: Optional[torch.Tensor],
         video_grid_thw: Optional[torch.Tensor],
         past_key_values,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.LongTensor]:
         """3D M-RoPE position ids for the Qwen3EuroVL backbone, reusing the exact same
         ``get_rope_index`` that Megatron's ``Qwen3EuroVLModel.forward`` calls (see
@@ -292,6 +293,13 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         extend instead: cache the per-batch offset between the 3D positions and a flat token
         count at prefill, then add it to a simple running count on every later step. Mirrors
         ``Qwen2VLModel.rope_deltas`` in the installed ``transformers`` version.
+
+        ``attention_mask`` matters for batched (padded) prefill: without it, ``get_rope_index``
+        would treat left-padding tokens as real content and compute wrong positions for every
+        row. With it, positions are computed only over each row's valid tokens (see
+        ``get_rope_index``'s padded-batch path) -- the per-row delta below still works
+        unmodified for padded rows, since ``past_length`` (from the shared KV cache) grows by
+        the same padded width for every row regardless of its own content length.
 
         Returns ``None`` for the plain EuroLLM (Llama) backbone, which doesn't use M-RoPE --
         the underlying causal LM falls back to its own default 1D positions.
@@ -310,6 +318,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
                 spatial_merge_size=spatial_merge_size,
                 image_token_id=self.config.image_token_id,
                 video_token_id=self.config.video_token_id,

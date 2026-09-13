@@ -214,7 +214,7 @@ class Learnable2DInterpPosEmb(nn.Module):
             embeddings added in-place via residual addition.
         """
         pos_embs = []
-
+        # import pdb; pdb.set_trace()
         for shape in grid_hws.tolist():
             if shape == self.weight.shape[:-1]:
                 pos_embs.append(self.weight.flatten(end_dim=1))

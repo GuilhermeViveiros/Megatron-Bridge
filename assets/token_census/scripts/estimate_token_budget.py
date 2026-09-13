@@ -70,7 +70,7 @@ def discover_datasets(categories: set[str] | None = None) -> list[dict]:
     "knowledge") is in the set — across all three modalities.
     """
     datasets = []
-    for modality in ("image", "multiimage", "video"):
+    for modality in ("image", "multiimage", "video", "text"):
         root = DATA_ROOT / modality
         if not root.is_dir():
             continue
@@ -149,6 +149,38 @@ def _iter_multiimage_samples(tf: tarfile.TarFile):
         e = by_stem[stem]
         if "json" in e and "imgs" in e:
             yield [e["imgs"][i] for i in sorted(e["imgs"])], e["json"]
+
+
+def _sanitize_text_only_placeholders(conv: list) -> list:
+    """Neutralize stray ``<image>``/``<video>`` placeholders in text-only (zero-media) samples.
+
+    Some text corpora (found 2026-09-12: ``code/euroblocks``, a Codeforces-style competitive-
+    programming corpus) retain a literal ``<image>`` placeholder from their source (the original
+    problem page had an embedded diagram) even though this text-only dataset carries no actual
+    image file. Since ``EuroVLProcessor``'s ``image_token``/``video_token`` are real special
+    tokens shared with the multimodal path, left as-is these tokenize to the same id as a genuine
+    vision slot -- confirmed via the real tokenizer (``<image>`` embedded in prose -> the same
+    id as ``image_token_id``). For a text-modality sample specifically, ANY such tag is always a
+    stray placeholder (there is never a real image/video to pair it with), so it's always
+    correct to neutralize it here -- not a heuristic guess.
+    """
+    for turn in conv:
+        content = turn.get("content")
+        if isinstance(content, str):
+            turn["content"] = content.replace("<image>", "[image omitted]").replace("<video>", "[video omitted]")
+    return conv
+
+
+def _iter_text_samples(tf: tarfile.TarFile):
+    """Text-only samples: one bare ``{key}.json`` conversation per sample, no media file.
+
+    Yields ``([], json_member)`` -- the empty media list makes ``process_shard``'s shared
+    image/multiimage branch (``for m in media: ...``) a no-op, so no separate code path is
+    needed there; ``_exact_sample_tokens(conv, [], [])`` naturally handles zero images/videos.
+    """
+    for m in tf.getmembers():
+        if m.name.endswith(".json"):
+            yield [], m
 
 
 def _iter_video_samples(tf: tarfile.TarFile):
@@ -252,10 +284,7 @@ def _exact_sample_tokens(conv: list, image_sizes: list, video_infos: list) -> tu
         # matches what the task encoder passes as video_metadata in real training.
         times = [duration / 2.0] if n_frames == 1 else [i * duration / (n_frames - 1) for i in range(n_frames)]
         per_frame = "".join(
-            f"<{format_timestamp(t, _processor.timestamp_format)}>"
-            + vstart
-            + "<|placeholder|>" * frame_tokens
-            + vend
+            f"<{format_timestamp(t, _processor.timestamp_format)}>" + vstart + "<|placeholder|>" * frame_tokens + vend
             for t in times
         )
         if whole_block in text:
@@ -287,6 +316,8 @@ def process_shard(dataset_key: str, ds: dict, shard_path: str) -> dict:
                 sample_iter = _iter_image_samples(tf)
             elif ds["modality"] == "multiimage":
                 sample_iter = _iter_multiimage_samples(tf)
+            elif ds["modality"] == "text":
+                sample_iter = _iter_text_samples(tf)
             else:
                 sample_iter = _iter_video_samples(tf)
 
@@ -304,6 +335,8 @@ def process_shard(dataset_key: str, ds: dict, shard_path: str) -> dict:
                     # rather than letting it fail silently as an n_failed sample.
                     if len(conv) == 1 and isinstance(conv[0], list):
                         conv = conv[0]
+                    if ds["modality"] == "text":
+                        conv = _sanitize_text_only_placeholders(conv)
                     if ds["modality"] == "video":
                         raw = tf.extractfile(media).read()
                         info = _video_duration_and_size(raw)
@@ -329,14 +362,30 @@ def process_shard(dataset_key: str, ds: dict, shard_path: str) -> dict:
                     n_failed += 1
     except Exception as e:  # noqa: BLE001 — one bad shard shouldn't kill the dataset
         return {
-            "dataset_key": dataset_key, "shard": os.path.basename(shard_path),
-            "n_ok": 0, "n_failed": 0, "sum_text": 0, "sum_vision": 0,
-            "sum_w": 0, "sum_h": 0, "sum_ratio": 0.0, "n_images": 0, "shard_error": f"{type(e).__name__}: {e}",
+            "dataset_key": dataset_key,
+            "shard": os.path.basename(shard_path),
+            "n_ok": 0,
+            "n_failed": 0,
+            "sum_text": 0,
+            "sum_vision": 0,
+            "sum_w": 0,
+            "sum_h": 0,
+            "sum_ratio": 0.0,
+            "n_images": 0,
+            "shard_error": f"{type(e).__name__}: {e}",
         }
     return {
-        "dataset_key": dataset_key, "shard": os.path.basename(shard_path),
-        "n_ok": n_ok, "n_failed": n_failed, "sum_text": sum_text, "sum_vision": sum_vision,
-        "sum_w": sum_w, "sum_h": sum_h, "sum_ratio": sum_ratio, "n_images": n_images, "shard_error": None,
+        "dataset_key": dataset_key,
+        "shard": os.path.basename(shard_path),
+        "n_ok": n_ok,
+        "n_failed": n_failed,
+        "sum_text": sum_text,
+        "sum_vision": sum_vision,
+        "sum_w": sum_w,
+        "sum_h": sum_h,
+        "sum_ratio": sum_ratio,
+        "n_images": n_images,
+        "shard_error": None,
     }
 
 
@@ -350,6 +399,7 @@ def _worker(args) -> dict:
 
 
 def combine(outdir: Path, datasets: list[dict]) -> None:
+    """Merge per-shard census JSON files into one combined summary per category."""
     by_key = {_dataset_key(ds): ds for ds in datasets}
     rows = []
     for ds_dir in sorted(outdir.iterdir()):
@@ -376,9 +426,14 @@ def combine(outdir: Path, datasets: list[dict]) -> None:
             if r.get("shard_error"):
                 shard_errors.append((r["shard"], r["shard_error"]))
         row = {
-            **ds, "dataset_key": key, "n_ok": n_ok, "n_failed": n_failed,
-            "total_text_tokens": sum_text, "total_vision_tokens": sum_vision,
-            "total_tokens": sum_text + sum_vision, "shard_errors": shard_errors,
+            **ds,
+            "dataset_key": key,
+            "n_ok": n_ok,
+            "n_failed": n_failed,
+            "total_text_tokens": sum_text,
+            "total_vision_tokens": sum_vision,
+            "total_tokens": sum_text + sum_vision,
+            "shard_errors": shard_errors,
         }
         if n_ok:
             row["avg_text_tokens"] = sum_text / n_ok
@@ -403,7 +458,9 @@ def combine(outdir: Path, datasets: list[dict]) -> None:
         )
     print(f"\n{len(rows)} datasets, grand total EXACT tokens (all samples, all shards): {grand_total:,}")
 
-    (outdir / "_combined_summary.json").write_text(json.dumps({"grand_total_tokens": grand_total, "datasets": rows}, indent=2))
+    (outdir / "_combined_summary.json").write_text(
+        json.dumps({"grand_total_tokens": grand_total, "datasets": rows}, indent=2)
+    )
 
 
 def main() -> None:
@@ -413,7 +470,9 @@ def main() -> None:
     parser.add_argument("--outdir", type=Path, default=OUTDIR_DEFAULT)
     parser.add_argument("--combine-only", action="store_true", help="Skip processing, just re-summarize --outdir")
     parser.add_argument(
-        "--categories", type=str, default=None,
+        "--categories",
+        type=str,
+        default=None,
         help="Comma-separated category filter across all modalities, e.g. 'captioning,knowledge'. Default: all.",
     )
     args = parser.parse_args()
@@ -427,7 +486,9 @@ def main() -> None:
         tasks = []
         for ds in datasets:
             key = _dataset_key(ds)
-            for shard in sorted(Path(ds["path"]).glob("shard-*.tar")):
+            # "shard-*.tar" (image/multiimage/video) and "shard_*.tar" (text, e.g. euroblocks) --
+            # both end in ".tar" so neither pattern picks up the "*.tar.idx" sidecar files.
+            for shard in sorted(Path(ds["path"]).glob("shard[-_]*.tar")):
                 tasks.append((key, ds, str(shard), args.outdir))
         print(f"Discovered {len(datasets)} datasets, {len(tasks)} shard tasks. Workers={args.workers}")
 

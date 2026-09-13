@@ -14,9 +14,7 @@
 
 """Regenerate assets/token_census/README.md from the raw _combined_summary.json files,
 grouped by real dataset category (captioning, chart, code, ... 16 total) and, within each
-category, by modality (image / multiimage / video / text). There are currently no text-only
-(zero-vision) datasets in the census -- the "text" bucket is always empty, kept as an explicit
-heading rather than silently dropped so a future text-only addition has an obvious home.
+category, by modality (image / multiimage / video / text).
 
 Run: uv run --no-sync python assets/token_census/scripts/render_readme.py
 """
@@ -33,12 +31,14 @@ SOURCE_FILES = [
     RESULTS_DIR / "ocr" / "_combined_summary.json",
     RESULTS_DIR / "doc" / "_combined_summary.json",
     RESULTS_DIR / "remaining_categories" / "_combined_summary.json",
+    RESULTS_DIR / "text" / "_combined_summary.json",
 ]
 
 MODALITY_ORDER = ["image", "multiimage", "video", "text"]
 
 
 def fmt_tokens(n: int) -> str:
+    """Format a token count as a human-readable B/M/comma-grouped string."""
     if n >= 1e9:
         return f"{n / 1e9:.2f}B"
     if n >= 1e6:
@@ -46,15 +46,37 @@ def fmt_tokens(n: int) -> str:
     return f"{n:,}"
 
 
+# Censused (real, exact) but intentionally excluded from the rendered README because they're
+# not in mixture.yaml's blend -- keeps this file describing the mixture actually being trained
+# on, not just "everything that happens to be indexed on disk".
+#
+# doc750k (both image and multiimage variants) -- dropped 2026-09-11: a 60-sample audit found
+# 0% of follow-up questions reference anything visual (the full paper text is given in the
+# prompt alongside the page images, and every question is answerable from that text alone).
+#
+# webmmu -- dropped 2026-09-12: avg 59,280 text tokens/sample (both the full original HTML/CSS/JS
+# file and the full rewritten file are given verbatim; one sample alone is ~938k characters). Too
+# long-context for this training phase; also only ~28% of instructions describe a visual defect
+# the model couldn't diagnose from the code text alone (a 60-sample audit), so the image is
+# decorative more often than not on top of the token cost. Revisit for a long-context phase.
+EXCLUDED_FROM_MIXTURE = {
+    ("image", "doc", "doc750k"),
+    ("multiimage", "doc", "doc750k"),
+    ("image", "code", "webmmu"),
+}
+
+
 def load_rows() -> list[dict]:
+    """Load every censused dataset row, excluding ones dropped from the real mixture."""
     rows = []
     for f in SOURCE_FILES:
         d = json.loads(f.read_text())
         rows.extend(d["datasets"])
-    return rows
+    return [r for r in rows if (r["modality"], r["category"], r["name"]) not in EXCLUDED_FROM_MIXTURE]
 
 
 def render_dataset_table(rows: list[dict]) -> str:
+    """Render one markdown table of per-dataset token/image stats, sorted by total tokens."""
     rows = sorted(rows, key=lambda r: r["total_tokens"], reverse=True)
     lines = [
         "| dataset | samples | avg vision | avg text | total vision | total text | avg w | avg h | ratio |",
@@ -72,6 +94,7 @@ def render_dataset_table(rows: list[dict]) -> str:
 
 
 def render_modality_section(modality: str, rows: list[dict], categories: list[str]) -> str:
+    """Render one modality's `# heading` section, broken down into per-category `## ` tables."""
     total_tokens = sum(r["total_tokens"] for r in rows)
     total_samples = sum(r["n_ok"] for r in rows)
     parts = [f"# {modality}", ""]
@@ -111,6 +134,7 @@ def render_modality_section(modality: str, rows: list[dict], categories: list[st
 
 
 def main() -> None:
+    """Regenerate README.md from the combined per-category census summaries."""
     rows = load_rows()
     categories = sorted({r["category"] for r in rows})
     grand_total = sum(r["total_tokens"] for r in rows)
@@ -127,9 +151,17 @@ real per-frame timestamp text) before running at scale — see
 `assets/token_census/scripts/validate_token_estimates.py`.
 
 Organized by real dataset category (matching `mixture.yaml`'s taxonomy), and within each
-category by modality (image / multiimage / video / text). There are currently no text-only
-(zero-vision) datasets in this census — the "text" subsection is always empty, kept explicit
-rather than dropped so a future text-only addition has an obvious home.
+category by modality (image / multiimage / video / text). Text-only (zero-vision) samples are
+tokenized the same way minus the image/video expansion step — no pixel decode is needed there
+either, since there's nothing to decode.
+
+Text-only samples also get a placeholder-sanitization pass (`_sanitize_text_only_placeholders`
+in `estimate_token_budget.py`) before tokenizing: some text corpora (found 2026-09-12 in
+`code/euroblocks`, a Codeforces-style competitive-programming source) retain a literal `<image>`
+placeholder from their original source even though this text-only dataset carries no actual
+image file. Left as-is, that tokenizes to the same id as a real vision slot (confirmed against
+the live tokenizer) — a real training-time hazard the actual text-SFT encoder path needs its own
+fix for, independent of this census script's sanitization.
 
 Regenerate the raw census: `./apptainer.sh uv run --no-sync python assets/token_census/scripts/estimate_token_budget.py --categories <cats> --workers 16`
 (use 16, not 64 — 64 concurrent worker imports exhausted file descriptors on this filesystem).
@@ -139,10 +171,13 @@ Regenerate this file from existing raw results: `uv run --no-sync python assets/
 
 **{len(rows)} datasets censused, {grand_samples:,} samples, {fmt_tokens(grand_total)} tokens (r=1, one epoch each).**
 
-Note: as of this generation, 9 real datasets discovered on disk are NOT yet in this census
-(`leopard_arxiv_enriched_translated`, `doc750k`, `docmatix`, `leopard_dude`, `leopard_monkey`,
-`leopard_mpdocvqa`, `molmo2_doc` — some appear under both `image` and `multiimage`) — either
-missing `.nv-meta` energon indexing or added/renamed after the last census run. A handful of
+Note: `doc750k` (both `image` and `multiimage` variants) and `webmmu` are censused but
+deliberately excluded from this file and from `mixture.yaml`. `doc750k`: a 60-sample audit found
+0% of its follow-up questions reference anything visual (the full paper text is given in the
+prompt alongside the page images, so every question is answerable from that text alone).
+`webmmu`: avg 59,280 text tokens/sample (full original + full rewritten HTML/CSS/JS file, one
+sample alone ~938k characters) is too long-context for this training phase, and only ~28% of its
+edit instructions describe a visual defect the code text alone doesn't reveal. A handful of
 `_buggy_backup`/`_preshuffle_backup` directories also exist on disk and are intentionally excluded
 (not real additional data).
 

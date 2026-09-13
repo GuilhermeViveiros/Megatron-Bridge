@@ -186,3 +186,9 @@ slurm*.out
 # UV package manager
 .uv/
 sanity_check/
+
+# Eval harness outputs (downloaded media, generated captions, judge scores)
+evals/data/*
+!evals/data/.gitkeep
+evals/results/*
+!evals/results/.gitkeep
