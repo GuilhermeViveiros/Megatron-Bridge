@@ -47,6 +47,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.modeling_euro_vl_hf import EuroVLForConditionalGeneration
 from megatron.bridge.models.euro_vl.moonvit import MoonViTConfig, MoonViTImageProcessor
+from megatron.bridge.utils.hf_tokenizer_save import preserve_legacy_tokenizer_flag
 
 
 _NUM_VISION_TOKENS = 5
@@ -148,6 +149,15 @@ def assemble(eurollm_path: str, moonvit_path: str, output_path: str) -> None:
     model.save_pretrained(output_path)
 
     # 6. Extend the tokenizer with the 5 vision special tokens + chat template, save.
+    #
+    # tokenizer.save_pretrained() silently drops tokenizer_config.json's `legacy` key
+    # (verified against transformers==5.8.1: the live `tokenizer.legacy` attribute is correct
+    # both before and after the drop, but save_pretrained() never consults it when writing).
+    # For EuroLLM's Llama-family SentencePiece tokenizer, `legacy` controls whether the class
+    # builds its pre-tokenizer with `Metaspace(prepend_scheme="always")` (legacy=True, matches
+    # pretraining) or `"first"` (legacy missing/False) -- losing it changes real tokenization:
+    # chat-turn role headers right after a special token re-segment (`▁assistant` -> `ass`+
+    # `istant`). preserve_legacy_tokenizer_flag() restores it post-save.
     print("🔤 Saving extended tokenizer (+ vision tokens, chat template) ...")
     tokenizer = AutoTokenizer.from_pretrained(eurollm_path)
     tokenizer.add_special_tokens({"additional_special_tokens": list(_VISION_TOKENS)})
@@ -156,6 +166,13 @@ def assemble(eurollm_path: str, moonvit_path: str, output_path: str) -> None:
         assert actual_id == expected_id, f"{token!r} got ID {actual_id}, expected {expected_id}"
     tokenizer.chat_template = _CHAT_TEMPLATE
     tokenizer.save_pretrained(output_path)
+    preserve_legacy_tokenizer_flag(eurollm_path, output_path)
+
+    # Verify: reload (load only, never re-save) and check the 5 vision token ids.
+    tokenizer = AutoTokenizer.from_pretrained(output_path)
+    for token, expected_id in _VISION_TOKENS.items():
+        actual_id = tokenizer.convert_tokens_to_ids(token)
+        assert actual_id == expected_id, f"{token!r} got ID {actual_id}, expected {expected_id}"
 
     # 7. Save the MoonViT image-processor config so EuroVLProcessor can load
     #    everything from a single directory. The video processor shares this config

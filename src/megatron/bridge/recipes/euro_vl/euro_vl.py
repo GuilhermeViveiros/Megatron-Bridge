@@ -214,6 +214,15 @@ def _build_base_sft_config() -> ConfigContainer:
     # -> random init -> loss ~ ln(vocab)). Callers may override this.
     cfg.checkpoint.pretrained_checkpoint = EUROVL_MCORE
 
+    # Same override the Qwen3/Gemma arms use (missing here previously -- confirmed the eurollm_pa
+    # checkpoints' bundled iter_*/tokenizer dirs were all empty as a result): without
+    # tokenizer_type="HuggingFaceTokenizer" this defaults to NullTokenizer, whose
+    # save_tokenizer_assets branch writes nothing (the dir still gets created, just left empty).
+    # Inference/eval can then load the tokenizer from the checkpoint itself.
+    cfg.checkpoint.save_tokenizer_assets = True
+    cfg.tokenizer.tokenizer_type = "HuggingFaceTokenizer"
+    cfg.tokenizer.tokenizer_model = EUROVL_HF
+
     # DDP settings
     cfg.ddp.overlap_grad_reduce = False
     cfg.ddp.overlap_param_gather = False

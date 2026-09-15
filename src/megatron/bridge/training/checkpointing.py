@@ -88,6 +88,7 @@ from megatron.bridge.utils.common_utils import (
     is_last_rank,
     print_rank_0,
 )
+from megatron.bridge.utils.hf_tokenizer_save import preserve_legacy_tokenizer_flag
 from megatron.bridge.utils.import_utils import safe_import
 
 
@@ -1431,6 +1432,7 @@ def save_tokenizer_assets(
                     else:
                         logger.debug(f"{tokenizer_type} does not support save_pretrained(), skipping tokenizer save")
                         return
+                    preserve_legacy_tokenizer_flag(tokenizer_config.tokenizer_model, tmp_dir)
 
                     logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
                     for filename in os.listdir(tmp_dir):
@@ -1446,6 +1448,7 @@ def save_tokenizer_assets(
                     tokenizer.save_pretrained(tokenizer_dir)
                 elif hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "save_pretrained"):
                     tokenizer._tokenizer.save_pretrained(tokenizer_dir)
+                preserve_legacy_tokenizer_flag(tokenizer_config.tokenizer_model, tokenizer_dir)
             return
 
         # Handle file-based tokenizers - resolve all paths
