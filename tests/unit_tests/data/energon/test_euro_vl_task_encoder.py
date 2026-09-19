@@ -217,3 +217,223 @@ class TestEuroVLTaskEncoderSkipOnTruncation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Message-tree samples
+# ---------------------------------------------------------------------------
+
+_IM_START, _IM_END, _NEWLINE, _VIDEO_TOKEN = 5, 6, 7, 98
+_VIDEO_TOKENS_PER_VIDEO = 4
+
+
+class _WordTokenizer:
+    """Deterministic word-level tokenizer: specials fixed, words get ids from 100 on."""
+
+    pad_token_id = 0
+    eos_token_id = 1
+    added_tokens_decoder = {}
+
+    def __init__(self):
+        self.vocab = {"<|im_start|>": _IM_START, "<|im_end|>": _IM_END, "\n": _NEWLINE, "<video>": _VIDEO_TOKEN}
+
+    def _ids(self, text):
+        import re
+
+        ids = []
+        for piece in re.split(r"(<\|im_start\|>|<\|im_end\|>|<video>|\n| )", text):
+            if piece in ("", " "):
+                continue
+            if piece not in self.vocab:
+                self.vocab[piece] = 100 + len(self.vocab)
+            ids.append(self.vocab[piece])
+        return ids
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": self._ids(text)}
+
+    def encode(self, text, add_special_tokens=False):
+        return self._ids(text)
+
+    def convert_tokens_to_ids(self, token):
+        return self.vocab[token]
+
+
+class _FakeVideoProcessor:
+    """ChatML template + joint call that expands each ``<video>`` into a fixed block of tokens."""
+
+    video_token_id = _VIDEO_TOKEN
+    image_token_id = 99
+
+    def __init__(self):
+        self.tokenizer = _WordTokenizer()
+        self.calls = 0
+
+    def apply_chat_template(self, conversation, tokenize=False):
+        out = ""
+        for turn in conversation:
+            content = turn["content"]
+            if isinstance(content, list):
+                content = " ".join("<video>" if c["type"] == "video" else c["text"] for c in content)
+            out += f"<|im_start|> {turn['role']}\n{content}<|im_end|>\n"
+        return out
+
+    def __call__(self, text, videos=None, return_tensors="pt", **kwargs):
+        self.calls += 1
+        ids = []
+        for tok in self.tokenizer._ids(text):
+            ids.extend([_VIDEO_TOKEN] * _VIDEO_TOKENS_PER_VIDEO if tok == _VIDEO_TOKEN else [tok])
+        n_videos = len(videos) if videos else 0
+        return {
+            "input_ids": torch.tensor([ids]),
+            "pixel_values_videos": torch.ones(n_videos * _VIDEO_TOKENS_PER_VIDEO, 3),
+            "video_grid_thw": torch.tensor([[1, 2, 2]] * n_videos),
+        }
+
+
+def _tree_sample(branches, shared=None, key="clip_g0", videos="default"):
+    tree = {
+        "message_tree": True,
+        "shared": shared if shared is not None else [{"role": "user", "content": "<video>"}],
+        "branches": branches,
+        "meta": {},
+    }
+    return ChatMLSample(
+        __key__=key,
+        __restore_key__=(),
+        __subflavor__=None,
+        __subflavors__={},
+        imgs=None,
+        videos=[[torch.rand(3, 4, 4), torch.rand(3, 4, 4)]] if videos == "default" else videos,
+        conversation=json.dumps(tree),
+    )
+
+
+def _qa(question, answer):
+    return [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+
+
+class TestEuroVLMessageTree(unittest.TestCase):
+    """Message-tree samples: one shared media prefix, several independent QA branches."""
+
+    BRANCHES = [_qa("what color", "red car"), _qa("how many", "three"), _qa("where is it", "a big road here")]
+
+    def _encoder(self, seq_length=256, sqrt=False):
+        processor = _FakeVideoProcessor()
+        return EuroVLTaskEncoder(processor=processor, seq_length=seq_length, sqrt_loss_weighting=sqrt), processor
+
+    def _supervised_text(self, processor, encoded, positions):
+        inv = {v: k for k, v in processor.tokenizer.vocab.items()}
+        # Supervision on label position i targets input token i + 1.
+        return " ".join(inv[int(encoded.input_ids[i + 1])] for i in positions)
+
+    def test_flat_json_list_is_not_a_tree(self):
+        self.assertIsNone(EuroVLTaskEncoder._parse_message_tree(json.dumps(self.BRANCHES[0])))
+        self.assertIsNone(EuroVLTaskEncoder._parse_message_tree(json.dumps({"branches": []})))
+        self.assertIsNotNone(EuroVLTaskEncoder._parse_message_tree(json.dumps({"message_tree": True})))
+
+    def test_video_encoded_once_and_tokens_appear_once(self):
+        encoder, processor = self._encoder()
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        self.assertEqual(processor.calls, 1)
+        self.assertEqual(int((encoded.input_ids == _VIDEO_TOKEN).sum()), _VIDEO_TOKENS_PER_VIDEO)
+        self.assertEqual(tuple(encoded.visual_tensors["pixel_values_videos"].shape), (_VIDEO_TOKENS_PER_VIDEO, 3))
+
+    def test_subsegment_ids_mark_prefix_and_branches(self):
+        encoder, _ = self._encoder()
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        ids = encoded.subsegment_ids
+        self.assertEqual(ids.dtype, torch.int32)
+        self.assertEqual(ids.shape, encoded.input_ids.shape)
+        im_starts = (encoded.input_ids == _IM_START).nonzero(as_tuple=True)[0].tolist()
+        # Shared turn (turn 0) is attend-all, including the video; branch b starts at turn 1 + 2b.
+        self.assertTrue(bool((ids[: im_starts[1]] == 10000).all()))
+        for b in range(3):
+            end = im_starts[3 + 2 * b] if b < 2 else len(ids)
+            self.assertTrue(bool((ids[im_starts[1 + 2 * b] : end] == b).all()), f"branch {b}")
+
+    def test_shared_user_turn_is_not_relabelled_system(self):
+        """The odd-length turn list must not go through cook_chatml_sample's system heuristic."""
+        encoder, processor = self._encoder()
+        encoder.encode_sample(_tree_sample(self.BRANCHES))
+        self.assertNotIn("system", processor.tokenizer.vocab)
+
+    def test_loss_only_on_answers(self):
+        encoder, processor = self._encoder()
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        positions = (encoded.loss_mask > 0).nonzero(as_tuple=True)[0].tolist()
+        self.assertEqual(self._supervised_text(processor, encoded, positions), "red car three a big road here")
+        self.assertTrue(bool((encoded.labels[encoded.loss_mask == 0] == -100).all()))
+        self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1 / 3**0.5).all()))
+
+    def test_sqrt_weighting_per_branch_then_divided_by_sqrt_num_branches(self):
+        encoder, _ = self._encoder(sqrt=True)
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        for b, n_tokens in enumerate((2, 1, 4)):
+            weights = encoded.loss_mask[(encoded.subsegment_ids == b) & (encoded.loss_mask > 0)]
+            self.assertEqual(len(weights), n_tokens)
+            torch.testing.assert_close(weights, torch.full((n_tokens,), 1 / (n_tokens**0.5 * 3**0.5)))
+
+    def test_over_length_keeps_whole_branches(self):
+        encoder, _ = self._encoder()
+        full = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        im_starts = (full.input_ids == _IM_START).nonzero(as_tuple=True)[0].tolist()
+        branch2_start = im_starts[5]
+        encoder, _ = self._encoder(seq_length=branch2_start + 3)  # third branch does not fit
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        self.assertEqual(len(encoded.input_ids), branch2_start)
+        torch.testing.assert_close(encoded.input_ids, full.input_ids[:branch2_start])
+        self.assertEqual(set(encoded.subsegment_ids.tolist()), {10000, 0, 1})
+        self.assertEqual(int(encoded.labels[-1]), -100)
+        self.assertEqual(float(encoded.loss_mask[-1]), 0.0)
+        # B counts kept branches only.
+        self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1 / 2**0.5).all()))
+
+    def test_skip_when_no_branch_fits(self):
+        encoder, _ = self._encoder(seq_length=8)
+        with self.assertRaises(SkipSample):
+            encoder.encode_sample(_tree_sample(self.BRANCHES))
+
+    def test_media_placeholder_in_branch_raises(self):
+        encoder, _ = self._encoder()
+        with self.assertRaises(ValueError):
+            encoder.encode_sample(_tree_sample([_qa("<video> what", "red")]))
+
+    def test_turn_count_mismatch_raises(self):
+        encoder, _ = self._encoder()
+        # An extra <|im_start|> inside a question breaks the one-per-turn assumption.
+        with self.assertRaisesRegex(ValueError, "im_start"):
+            encoder.encode_sample(_tree_sample([_qa("what <|im_start|> color", "red")]))
+
+    def test_branch_without_supervised_tokens_raises(self):
+        encoder, _ = self._encoder()
+        with self.assertRaisesRegex(ValueError, "branch 0"):
+            encoder.encode_sample(_tree_sample([_qa("what", "")]))
+
+    def test_packing_carries_subsegment_ids(self):
+        encoder, _ = self._encoder(seq_length=256)
+        tree = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        flat = encoder.encode_sample(
+            ChatMLSample(
+                __key__="flat",
+                __restore_key__=(),
+                __subflavor__=None,
+                __subflavors__={},
+                imgs=None,
+                videos=None,
+                conversation=json.dumps(_qa("hello", "hi there")),
+            )
+        )
+        self.assertIsNone(getattr(flat, "subsegment_ids", None))
+
+        packed = encoder.pack_selected_samples([flat, tree])
+        n_flat = len(flat.input_ids)
+        self.assertTrue(bool((packed.subsegment_ids[:n_flat] == 10000).all()))
+        torch.testing.assert_close(packed.subsegment_ids[n_flat:], tree.subsegment_ids)
+
+        out = encoder.encode_batch(encoder.batch([packed]))
+        self.assertEqual(tuple(out["subsegment_ids"].shape), (1, 256))
+        self.assertTrue(bool((out["subsegment_ids"][0, len(packed.input_ids) :] == 10000).all()))
+
+        flat_only = encoder.encode_batch(encoder.batch([encoder.pack_selected_samples([flat])]))
+        self.assertIsNone(flat_only["subsegment_ids"])

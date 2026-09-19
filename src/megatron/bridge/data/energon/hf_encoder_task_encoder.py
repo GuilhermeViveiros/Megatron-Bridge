@@ -22,7 +22,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -164,6 +164,57 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
     # encode_sample
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _structure_media_placeholders(conversation: List[Dict], has_images: bool, has_videos: bool) -> None:
+        """Replace ``<image>``/``<video>`` in string turn contents with structured content items.
+
+        Mutates ``conversation`` in place so ``apply_chat_template`` inserts the model-specific
+        vision tokens. Both markers are handled in one ordered split so a turn may interleave
+        images and videos; markers with no matching media are left as plain text.
+        """
+        if not (has_images or has_videos):
+            return
+        for turn in conversation:
+            text = turn["content"]
+            if not isinstance(text, str):
+                continue  # already structured content
+            if not (("<image>" in text and has_images) or ("<video>" in text and has_videos)):
+                continue
+            content_parts: list = []
+            for part in re.split(r"(<image>|<video>)", text):
+                if part == "<image>" and has_images:
+                    content_parts.append({"type": "image"})
+                elif part == "<video>" and has_videos:
+                    content_parts.append({"type": "video"})
+                elif part.strip():
+                    content_parts.append({"type": "text", "text": part.strip()})
+            turn["content"] = content_parts
+
+    def _run_processor(self, prompt_text: str, images_pil, videos_pil, video_metadata=None) -> Dict[str, Any]:
+        """Jointly tokenize ``prompt_text`` and preprocess its images/videos with the HF processor."""
+        proc_kwargs = {"text": prompt_text, "return_tensors": "pt"}
+        if images_pil is not None:
+            proc_kwargs["images"] = images_pil
+        if videos_pil is not None:
+            proc_kwargs["videos"] = videos_pil
+        if self.min_pixels is not None:
+            proc_kwargs["min_pixels"] = self.min_pixels
+        if self.max_pixels is not None:
+            proc_kwargs["max_pixels"] = self.max_pixels
+        # Optional per-video metadata (e.g. real frame timestamps) if the sample carries it.
+        if video_metadata is not None and videos_pil is not None:
+            proc_kwargs["video_metadata"] = video_metadata
+        return self.processor(**proc_kwargs)
+
+    def _collect_visual_tensors(self, proc_output: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Pull ``self.visual_keys`` out of the processor output as tensors."""
+        visual_tensors: Dict[str, torch.Tensor] = {}
+        for key in self.visual_keys:
+            val = proc_output.get(key)
+            if val is not None:
+                visual_tensors[key] = val if isinstance(val, torch.Tensor) else torch.tensor(val)
+        return visual_tensors
+
     def encode_sample(self, sample: ChatMLSample) -> HFEncoderTaskSample:
         """Encode a single ChatML sample into model-ready tensors.
 
@@ -183,27 +234,8 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         conversation = cook_chatml_sample(sample.conversation)
 
         # 2b. Convert <image>/<video> placeholders to structured multimodal content so that
-        #     apply_chat_template inserts the model-specific vision tokens. Both are handled in a
-        #     single ordered split so a turn may interleave images and videos.
-        has_images = images_pil is not None
-        has_videos = videos_pil is not None
-        if has_images or has_videos:
-            for turn in conversation:
-                text = turn["content"]
-                if not isinstance(text, str):
-                    continue  # already structured content
-                if not (("<image>" in text and has_images) or ("<video>" in text and has_videos)):
-                    continue
-                parts = re.split(r"(<image>|<video>)", text)
-                content_parts: list = []
-                for part in parts:
-                    if part == "<image>" and has_images:
-                        content_parts.append({"type": "image"})
-                    elif part == "<video>" and has_videos:
-                        content_parts.append({"type": "video"})
-                    elif part.strip():
-                        content_parts.append({"type": "text", "text": part.strip()})
-                turn["content"] = content_parts
+        #     apply_chat_template inserts the model-specific vision tokens.
+        self._structure_media_placeholders(conversation, images_pil is not None, videos_pil is not None)
 
         # 3. Get the full prompt text from chat template (not tokenized)
         # Use processor (not tokenizer) because conversation may contain
@@ -211,21 +243,7 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         prompt_text = self.processor.apply_chat_template(conversation, tokenize=False)
 
         # 4. Run processor for joint tokenization + vision preprocessing
-        proc_kwargs = {"text": prompt_text, "return_tensors": "pt"}
-        if images_pil is not None:
-            proc_kwargs["images"] = images_pil
-        if videos_pil is not None:
-            proc_kwargs["videos"] = videos_pil
-        if self.min_pixels is not None:
-            proc_kwargs["min_pixels"] = self.min_pixels
-        if self.max_pixels is not None:
-            proc_kwargs["max_pixels"] = self.max_pixels
-        # Optional per-video metadata (e.g. real frame timestamps) if the sample carries it.
-        vmeta = getattr(sample, "video_metadata", None)
-        if vmeta is not None and videos_pil is not None:
-            proc_kwargs["video_metadata"] = vmeta
-
-        proc_output = self.processor(**proc_kwargs)
+        proc_output = self._run_processor(prompt_text, images_pil, videos_pil, getattr(sample, "video_metadata", None))
 
         input_ids_t = proc_output["input_ids"]  # [1, seq]
         if input_ids_t.dim() == 2:
@@ -308,14 +326,7 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
                         )
 
         # 8. Collect visual tensors
-        visual_tensors: Dict[str, torch.Tensor] = {}
-        for key in self.visual_keys:
-            val = proc_output.get(key)
-            if val is not None:
-                if isinstance(val, torch.Tensor):
-                    visual_tensors[key] = val
-                else:
-                    visual_tensors[key] = torch.tensor(val)
+        visual_tensors = self._collect_visual_tensors(proc_output)
 
         # 8b. Slice visual tensors to keep only complete images
         if num_complete_images < num_images:

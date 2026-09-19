@@ -33,6 +33,7 @@ import dataclasses
 import io
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
@@ -48,7 +49,13 @@ from megatron.bridge.data.energon.hf_encoder_task_encoder import (
     HFEncoderTaskSample,
     HFEncoderVLMTaskEncoder,
 )
-from megatron.bridge.data.energon.task_encoder_utils import IGNORE_INDEX, ChatMLSample, cook_chatml_sample
+from megatron.bridge.data.energon.task_encoder_utils import (
+    IGNORE_INDEX,
+    ChatMLSample,
+    _images_to_pil,
+    _videos_to_pil,
+    cook_chatml_sample,
+)
 from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
@@ -70,9 +77,24 @@ _MULTI_IMAGE_RE = re.compile(r"^img(\d+)\.(?:jpg|jpeg|png)$")
 # mirroring the multi-image `img{i}` layout. A single-video sample uses a bare `mp4` part.
 _MULTI_VIDEO_RE = re.compile(r"^vid(\d+)\.(?:mp4|webm|mkv|mov|avi)$")
 
+# Message-tree samples: tokens of the shared prefix (the media turn) get this id and are visible to
+# every branch; branch b gets id b. Same convention as Molmo2
+# (olmo/preprocessing/text_preprocessor.py), whose mask is causal AND ids[q] <= ids[k].
+ATTEND_ALL_SUBSEGMENT_ID = 10000
+
 
 @dataclass
-class EuroVLPackedSample(HFEncoderTaskSample):
+class EuroVLTaskSample(HFEncoderTaskSample):
+    """An encoded sample that may carry per-token message-tree subsegment ids.
+
+    ``subsegment_ids`` is ``None`` for ordinary (flat) samples.
+    """
+
+    subsegment_ids: Optional[torch.Tensor] = None  # [seq_len] int32
+
+
+@dataclass
+class EuroVLPackedSample(EuroVLTaskSample):
     """An ``HFEncoderTaskSample`` that already concatenates several samples into one
     fill-to-``seq_length`` sequence, carrying the per-sub-sequence boundaries so the
     batch step can emit THD ``cu_seqlens`` for varlen attention.
@@ -90,6 +112,8 @@ class EuroVLPackedBatch(HFEncoderTaskBatch):
     cu_seqlens_unpadded: Optional[torch.Tensor] = None
     cu_seqlens_argmin: Optional[torch.Tensor] = None
     max_seqlen: Optional[torch.Tensor] = None
+    # [1, seq_length] message-tree subsegment ids; None when no sample in the pack is a tree.
+    subsegment_ids: Optional[torch.Tensor] = None
 
 
 def _crude_get(sample: dict, keys: tuple[str, ...]) -> Optional[Any]:
@@ -299,7 +323,14 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         ``create_multiturn_loss_mask_by_search`` — the same helper every VLM collate uses
         (qwen2_5, glm4v, ministral3, the EuroVL mock path) — which searches the *final*
         ``input_ids`` (robust to ``<image>`` expansion) with newline-context candidates.
+
+        Samples whose JSON is a message tree (``{"message_tree": true, ...}``) are routed to
+        :meth:`_encode_message_tree`; everything else takes the flat path below.
         """
+        tree = self._parse_message_tree(sample.conversation)
+        if tree is not None:
+            return self._encode_message_tree(sample, tree)
+
         encoded = super().encode_sample(sample)
 
         conversation = cook_chatml_sample(sample.conversation)
@@ -328,6 +359,141 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         encoded.loss_mask = shifted
         encoded.labels = labels
         return encoded
+
+    # ------------------------------------------------------------------
+    # Message-tree samples (docs/models/euro_vl/message_tree_packing.md)
+    #
+    # One media prefix shared by several independent branches (e.g. QA pairs about the same
+    # video), encoded once. Branch boundaries are recorded as per-token subsegment ids for the
+    # branch-isolation mask; until that mask exists, branches attend to each other like an
+    # ordinary multi-turn conversation.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_message_tree(conversation: Any) -> Optional[dict]:
+        """Return the parsed tree if ``conversation`` is a message-tree sample, else ``None``."""
+        if isinstance(conversation, (str, bytes, bytearray)):
+            try:
+                conversation = json.loads(conversation)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(conversation, dict) and conversation.get("message_tree") is True:
+            return conversation
+        return None
+
+    def _encode_message_tree(self, sample: ChatMLSample, tree: dict) -> EuroVLTaskSample:
+        """Encode ``shared`` + ``branches`` as one sequence with a single media encode.
+
+        Turns are laid out as the shared turns followed by every branch's turns. This bypasses
+        ``cook_chatml_sample``, which would relabel the media turn as ``system`` because a tree
+        always has an odd number of turns.
+        """
+        shared, branches = tree["shared"], tree["branches"]
+        key = sample.__key__
+        if not branches:
+            raise ValueError(f"Message-tree sample {key} has no branches")
+        if len(branches) >= ATTEND_ALL_SUBSEGMENT_ID:
+            raise ValueError(
+                f"Message-tree sample {key} has {len(branches)} branches (limit {ATTEND_ALL_SUBSEGMENT_ID})"
+            )
+        for branch in branches:
+            for turn in branch:
+                if "<image>" in turn["content"] or "<video>" in turn["content"]:
+                    raise ValueError(f"Message-tree sample {key}: media placeholders must be in 'shared' only")
+
+        images_pil = _images_to_pil(sample.imgs) if sample.imgs else None
+        videos_pil = _videos_to_pil(sample.videos) if sample.videos else None
+        turns = [dict(t) for t in shared] + [dict(t) for branch in branches for t in branch]
+        self._structure_media_placeholders(turns, images_pil is not None, videos_pil is not None)
+        prompt_text = self.processor.apply_chat_template(turns, tokenize=False)
+        proc_output = self._run_processor(prompt_text, images_pil, videos_pil, getattr(sample, "video_metadata", None))
+        input_ids = proc_output["input_ids"]
+        input_ids = (input_ids[0] if input_ids.dim() == 2 else input_ids).to(torch.long)
+        seq_len = int(input_ids.shape[0])
+
+        # Every turn starts with <|im_start|>, which never occurs inside a media expansion, so the
+        # k-th occurrence starts the k-th turn. A mismatch means the data or template is not what
+        # this layout assumes -- fail loudly rather than guess boundaries.
+        im_start_id = self._tokenizer.convert_tokens_to_ids("<|im_start|>")
+        turn_starts = (input_ids == im_start_id).nonzero(as_tuple=True)[0].tolist()
+        expected_turns = len(turns)
+        if len(turn_starts) != expected_turns:
+            raise ValueError(
+                f"Message-tree sample {key}: found {len(turn_starts)} <|im_start|> tokens, "
+                f"expected {expected_turns} ({len(shared)} shared + {expected_turns - len(shared)} branch turns)"
+            )
+        branch_starts, turn_idx = [], len(shared)
+        for branch in branches:
+            branch_starts.append(turn_starts[turn_idx])
+            turn_idx += len(branch)
+        branch_ends = branch_starts[1:] + [seq_len]
+
+        # Loss on assistant spans only, same search as the flat path; then shift to label positions.
+        skipped = extract_skipped_token_ids(self.processor)
+        mask = torch.tensor(
+            create_multiturn_loss_mask_by_search({"conversation": turns}, input_ids, self.processor, skipped),
+            dtype=torch.float32,
+        )
+        for b, (start, end) in enumerate(zip(branch_starts, branch_ends)):
+            if mask[start:end].sum() == 0:
+                raise ValueError(f"Message-tree sample {key}: no supervised tokens found for branch {b}")
+        loss_mask = torch.zeros_like(mask)
+        loss_mask[:-1] = mask[1:]
+        labels = input_ids.clone()
+        labels[:-1] = input_ids[1:]
+        labels[-1] = IGNORE_INDEX
+        labels[loss_mask == 0] = IGNORE_INDEX
+
+        # Over length: keep the longest prefix of whole branches that fits. Branches follow the
+        # media, so this never cuts it and needs no re-encode. Skip only if no branch fits.
+        n_keep = len(branches)
+        if seq_len > self.seq_length:
+            n_keep = sum(1 for end in branch_ends if end <= self.seq_length)
+            if n_keep == 0:
+                logging.warning(
+                    "Skipping message-tree sample %s: first branch ends at %d > seq_length=%d",
+                    key,
+                    branch_ends[0],
+                    self.seq_length,
+                )
+                raise SkipSample()
+            logging.warning(
+                "Message-tree sample %s: length %d > seq_length=%d; keeping %d of %d branches",
+                key,
+                seq_len,
+                self.seq_length,
+                n_keep,
+                len(branches),
+            )
+            cut = branch_ends[n_keep - 1]
+            input_ids, labels, loss_mask = input_ids[:cut], labels[:cut], loss_mask[:cut].clone()
+            labels[-1] = IGNORE_INDEX  # its next token was dropped
+            loss_mask[-1] = 0.0
+            branch_starts, branch_ends = branch_starts[:n_keep], branch_ends[:n_keep]
+
+        subsegment_ids = torch.full((int(input_ids.shape[0]),), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+        for b, (start, end) in enumerate(zip(branch_starts, branch_ends)):
+            subsegment_ids[start:end] = b
+            # Square-root weighting per branch (1/sqrt(N_b)), so each branch weighs what it would
+            # as a separate flat sample. Label positions of branch b lie inside [start, end).
+            if self.sqrt_loss_weighting:
+                n_supervised = int((loss_mask[start:end] > 0).sum())
+                if n_supervised > 0:
+                    loss_mask[start:end] /= n_supervised**0.5
+        # Down-weight by sqrt(number of kept branches), as Molmo2's "root_subsegments" does
+        # (olmo/preprocessing/text_preprocessor.py, tokenize_message_list), so clips with many
+        # annotations do not dominate. Counted after trimming, like Molmo2.
+        loss_mask /= math.sqrt(n_keep)
+
+        return EuroVLTaskSample(
+            __key__=sample.__key__,
+            __subflavors__=sample.__subflavors__,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            visual_tensors=self._collect_visual_tensors(proc_output),
+            subsegment_ids=subsegment_ids,
+        )
 
     # ------------------------------------------------------------------
     # Fill-to-seq_length packing (InternVL / Nemotron-Nano-V2 style)
@@ -391,6 +557,19 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         cu_seqlens = torch.zeros(len(seqlens) + 1, dtype=torch.int32)
         cu_seqlens[1:] = torch.tensor(seqlens, dtype=torch.int32).cumsum(0)
 
+        # Message-tree ids: flat samples are one attend-all subsegment. Omitted when the pack has no tree.
+        subsegment_ids = None
+        if any(getattr(s, "subsegment_ids", None) is not None for s in samples):
+            subsegment_ids = torch.cat(
+                [
+                    s.subsegment_ids
+                    if getattr(s, "subsegment_ids", None) is not None
+                    else torch.full((int(s.input_ids.shape[0]),), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+                    for s in samples
+                ],
+                dim=0,
+            )
+
         return EuroVLPackedSample(
             __key__=samples[0].__key__,
             __subflavors__=samples[0].__subflavors__,
@@ -400,6 +579,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             visual_tensors=visual_tensors,
             cu_seqlens=cu_seqlens,
             seqlens=seqlens,
+            subsegment_ids=subsegment_ids,
         )
 
     def batch(self, samples: List[HFEncoderTaskSample]) -> HFEncoderTaskBatch:
@@ -441,6 +621,12 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         cu_seqlens = torch.zeros(len(seqlens_full) + 1, dtype=torch.int32)
         cu_seqlens[1:] = torch.tensor(seqlens_full, dtype=torch.int32).cumsum(0)
         max_seqlen = torch.tensor(max(seqlens_full), dtype=torch.int32)
+        subsegment_ids = None
+        if s.subsegment_ids is not None:
+            subsegment_ids = torch.full((target_len,), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+            subsegment_ids[:total] = s.subsegment_ids
+            subsegment_ids = subsegment_ids.unsqueeze(0)
+
         # No sentinel padding in cu_seqlens -> argmin = len keeps every entry (see get_packed_seq_params).
         cu_seqlens_argmin = torch.tensor(len(cu_seqlens), dtype=torch.int32)
 
@@ -457,6 +643,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             cu_seqlens_unpadded=cu_seqlens.clone(),
             cu_seqlens_argmin=cu_seqlens_argmin,
             max_seqlen=max_seqlen,
+            subsegment_ids=subsegment_ids,
         )
         # Energon's Batch base may expose __key__ / __restore_key__ as init fields (varies by
         # version); only pass them when they are settable (mirrors HFEncoderVLMTaskEncoder.batch).
@@ -482,5 +669,6 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             "cu_seqlens_unpadded": batch.cu_seqlens_unpadded,
             "cu_seqlens_argmin": batch.cu_seqlens_argmin,
             "max_seqlen": batch.max_seqlen,
+            "subsegment_ids": batch.subsegment_ids,
             "visual_inputs": GenericVisualInputs(**{k: v for k, v in vt.items() if v is not None}),
         }
