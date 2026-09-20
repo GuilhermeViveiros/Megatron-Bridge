@@ -318,9 +318,15 @@ class TestEuroVLMessageTree(unittest.TestCase):
 
     BRANCHES = [_qa("what color", "red car"), _qa("how many", "three"), _qa("where is it", "a big road here")]
 
-    def _encoder(self, seq_length=256, sqrt=False):
+    def _encoder(self, seq_length=256, sqrt=False, root_subsegments=False):
         processor = _FakeVideoProcessor()
-        return EuroVLTaskEncoder(processor=processor, seq_length=seq_length, sqrt_loss_weighting=sqrt), processor
+        encoder = EuroVLTaskEncoder(
+            processor=processor,
+            seq_length=seq_length,
+            sqrt_loss_weighting=sqrt,
+            root_subsegments=root_subsegments,
+        )
+        return encoder, processor
 
     def _supervised_text(self, processor, encoded, positions):
         inv = {v: k for k, v in processor.tokenizer.vocab.items()}
@@ -364,14 +370,23 @@ class TestEuroVLMessageTree(unittest.TestCase):
         positions = (encoded.loss_mask > 0).nonzero(as_tuple=True)[0].tolist()
         self.assertEqual(self._supervised_text(processor, encoded, positions), "red car three a big road here")
         self.assertTrue(bool((encoded.labels[encoded.loss_mask == 0] == -100).all()))
-        self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1 / 3**0.5).all()))
+        # Default: no /sqrt(B) -- a tree weighs exactly what the same branches would weigh flat.
+        self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1.0).all()))
 
-    def test_sqrt_weighting_per_branch_then_divided_by_sqrt_num_branches(self):
+    def test_sqrt_weighting_is_per_branch_and_flat_equivalent_by_default(self):
+        """Each branch gets 1/sqrt(N_b), exactly as it would as a standalone flat sample."""
         encoder, _ = self._encoder(sqrt=True)
         encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
         for b, n_tokens in enumerate((2, 1, 4)):
             weights = encoded.loss_mask[(encoded.subsegment_ids == b) & (encoded.loss_mask > 0)]
             self.assertEqual(len(weights), n_tokens)
+            torch.testing.assert_close(weights, torch.full((n_tokens,), 1 / n_tokens**0.5))
+
+    def test_root_subsegments_divides_by_sqrt_num_branches(self):
+        encoder, _ = self._encoder(sqrt=True, root_subsegments=True)
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        for b, n_tokens in enumerate((2, 1, 4)):
+            weights = encoded.loss_mask[(encoded.subsegment_ids == b) & (encoded.loss_mask > 0)]
             torch.testing.assert_close(weights, torch.full((n_tokens,), 1 / (n_tokens**0.5 * 3**0.5)))
 
     def test_over_length_keeps_whole_branches(self):
@@ -386,7 +401,15 @@ class TestEuroVLMessageTree(unittest.TestCase):
         self.assertEqual(set(encoded.subsegment_ids.tolist()), {10000, 0, 1})
         self.assertEqual(int(encoded.labels[-1]), -100)
         self.assertEqual(float(encoded.loss_mask[-1]), 0.0)
-        # B counts kept branches only.
+        self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1.0).all()))
+
+    def test_root_subsegments_counts_kept_branches_only(self):
+        encoder, _ = self._encoder(root_subsegments=True)
+        full = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        im_starts = (full.input_ids == _IM_START).nonzero(as_tuple=True)[0].tolist()
+        encoder, _ = self._encoder(seq_length=im_starts[5] + 3, root_subsegments=True)
+        encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
+        self.assertEqual(set(encoded.subsegment_ids.tolist()), {10000, 0, 1})
         self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1 / 2**0.5).all()))
 
     def test_skip_when_no_branch_fits(self):

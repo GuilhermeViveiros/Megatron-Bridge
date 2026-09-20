@@ -141,6 +141,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         processor,
         seq_length: int = 8192,
         sqrt_loss_weighting: bool = False,
+        root_subsegments: bool = False,
         max_num_images: int = 16,
     ) -> None:
         # EuroVLProcessor returns pixel_values + image_grid_thw for images and
@@ -168,6 +169,15 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         # model.calculate_per_token_loss=True (Megatron then divides by the global sum of
         # weights, reproducing eq. 2 exactly).
         self.sqrt_loss_weighting = sqrt_loss_weighting
+        # Divide a message-tree sample's weights by sqrt(number of kept branches), as Molmo2's
+        # "root_subsegments" does. OFF by default so a grouped sample carries exactly the loss it
+        # would as separate flat samples (branch b keeps 1/sqrt(N_b)): grouping is then a pure
+        # compute optimization and cannot change training. Turning it on treats the whole group
+        # like one sample of the combined answer length (sum_b sqrt(N_b)/sqrt(B) = sqrt(sum_b N_b)
+        # for equal-length branches) -- i.e. it assumes annotations of one video are partly
+        # redundant. It costs video datasets a factor ~sqrt(B) of weight against the flat
+        # baseline, so revisit the mixture repeat factors before enabling it.
+        self.root_subsegments = root_subsegments
         # Register the cooker that decodes a crude sample into a ChatMLSample. A bound
         # method is picklable (the encoder itself is sent to dataloader workers).
         self.cookers = [Cooker(cook=self._cook)]
@@ -480,10 +490,11 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
                 n_supervised = int((loss_mask[start:end] > 0).sum())
                 if n_supervised > 0:
                     loss_mask[start:end] /= n_supervised**0.5
-        # Down-weight by sqrt(number of kept branches), as Molmo2's "root_subsegments" does
-        # (olmo/preprocessing/text_preprocessor.py, tokenize_message_list), so clips with many
-        # annotations do not dominate. Counted after trimming, like Molmo2.
-        loss_mask /= math.sqrt(n_keep)
+        # Optional: down-weight by sqrt(number of kept branches), as Molmo2's "root_subsegments"
+        # does (olmo/preprocessing/text_preprocessor.py, tokenize_message_list). Counted after
+        # trimming, like Molmo2. See __init__ for why this is off by default.
+        if self.root_subsegments:
+            loss_mask /= math.sqrt(n_keep)
 
         return EuroVLTaskSample(
             __key__=sample.__key__,

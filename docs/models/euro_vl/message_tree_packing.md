@@ -178,14 +178,30 @@ dispatches on `"message_tree": true`; all other samples take the existing flat p
    each branch weighs what it would as a separate flat sample. Per-sample weighting would shrink a
    2-branch sample by ~30% (e.g. captions of 400 + 300 tokens: √400 + √300 = 37.3 vs
    700/√700 = 26.5).
-7. **Divide by √B** (B = number of branches kept), always applied to message-tree samples. This
-   is Molmo2's `root_subsegments` weighting: without it a clip with 20 annotations contributes
-   20× the gradient of a clip with one; with it the clip's weight grows as √B. It trades off
-   against step 6: a branch in a B-branch group weighs `1/√B` of the same branch as a flat
-   sample.
+7. **Optional divide by √B** (`root_subsegments`, **off by default**; B = kept branches). Off, a
+   group weighs exactly what its branches would weigh as separate flat samples, so grouping is a
+   pure compute optimization and cannot change training — the property we want while converting
+   existing flat datasets. On, it is Molmo2's `root_subsegments`: combined with step 6 the group
+   weighs `Σ_b √N_b / √B`, which for equal-length branches is exactly `√(Σ_b N_b)`, i.e. the group
+   is weighted like *one* sample of the combined answer length. That assumes annotations of one
+   video are partly redundant (between counting them once, 1/B, and counting them as independent
+   samples, 1). It costs video datasets ~√B of weight against the flat baseline, so the mixture
+   repeat factors must be revisited before enabling it.
 8. **Over length (safety net):** cut at the last branch boundary that fits. Branches follow the
    video, so a cut never touches it and needs no re-encode. B in step 7 counts kept branches
    only. Skip only if no branch fits.
+
+Worked example — clip with 8 QAs of 25 answer tokens, `sqrt_loss_weighting` on:
+
+| | weight/token | per branch | clip total |
+|---|---|---|---|
+| the 8 QAs as flat samples (today) | 0.2 | 5 | 40 |
+| tree, `root_subsegments=False` (default) | 0.2 | 5 | 40 (identical) |
+| tree, `root_subsegments=True` | 0.0707 | 1.77 | 14.1 = √200 |
+
+Both weightings are heuristics with no published ablation (Molmo2's paper does not mention √B at
+all), so the plan is to measure per-dataset answer-token shares first and treat √B as a separate
+experiment.
 
 Position ids still run continuously through all branches. Molmo2 restarts them for every branch
 after the shared prefix (`build_subsegment_pos_ids`), so each branch sees the positions it would
