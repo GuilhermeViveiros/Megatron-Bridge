@@ -90,6 +90,45 @@ def _check_message_tree_support(provider: "Any") -> None:
         raise ValueError("message_tree_attention does not support use_bidirectional_image_attention")
 
 
+def _resolve_padded_vocab_size(provider: "Any") -> int:
+    """Return the vocabulary size the language model is built with.
+
+    ``GPTModelProvider.provide()`` pads the vocab when ``should_pad_vocab`` is set, but every
+    EuroVL provider overrides ``provide()`` and builds the decoder through
+    :func:`_build_mrope_gpt_model`, so that padding has to happen here instead. Without it an odd
+    vocabulary (EuroLLM's 128005) reaches ``VocabParallelEmbedding`` unpadded and any TP>1 run dies
+    at model build with ``128005 is not divisible by <TP>``.
+
+    ``provider.padded_vocab_size`` pins one TP-independent size (see
+    :data:`~megatron.bridge.models.euro_vl.utils.EUROLLM_PADDED_VOCAB_SIZE`); leaving it ``None``
+    falls back to Megatron's per-TP rule.
+
+    Args:
+        provider: The EuroVL model provider being built.
+
+    Returns:
+        The (possibly padded) vocabulary size.
+
+    Raises:
+        ValueError: If an explicit ``padded_vocab_size`` is smaller than the real vocabulary or is
+            not divisible by the tensor-parallel size.
+    """
+    from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
+
+    if not getattr(provider, "should_pad_vocab", False):
+        return provider.vocab_size
+
+    tp_size = provider.tensor_model_parallel_size
+    target = getattr(provider, "padded_vocab_size", None)
+    if target is None:
+        return calculate_padded_vocab_size(provider.vocab_size, provider.make_vocab_size_divisible_by, tp_size)
+    if target < provider.vocab_size:
+        raise ValueError(f"padded_vocab_size={target} is smaller than vocab_size={provider.vocab_size}")
+    if target % tp_size != 0:
+        raise ValueError(f"padded_vocab_size={target} is not divisible by tensor_model_parallel_size={tp_size}")
+    return target
+
+
 def _build_mrope_gpt_model(
     provider: "Any",
     pre_process: Optional[bool],
@@ -99,6 +138,9 @@ def _build_mrope_gpt_model(
 ) -> "Any":
     """Build Qwen3-VL's interleaved-M-RoPE ``Qwen3VLGPTModel`` as a language backbone.
 
+    NOTE on the vocabulary: this builder is what every EuroVL provider uses instead of
+    ``GPTModelProvider.provide()``, so it — not the base class — has to honour
+    ``should_pad_vocab``; see :func:`_resolve_padded_vocab_size`.
 
     Shared by every EuroVL M-RoPE provider (Qwen3, EuroLLM, ...) — ``Qwen3VLGPTModel`` and
     ``Qwen3VLSelfAttention`` are already config-driven (mrope_section, rotary_base,
@@ -116,6 +158,7 @@ def _build_mrope_gpt_model(
 
     assert provider.mrope_section is not None, f"{type(provider).__name__} requires mrope_section"
 
+    vocab_size = _resolve_padded_vocab_size(provider)
     _check_message_tree_support(provider)
     block_spec = get_transformer_block_with_experimental_attention_variant_spec(provider, vp_stage=vp_stage)
     if getattr(provider, "message_tree_attention", False):
@@ -144,7 +187,7 @@ def _build_mrope_gpt_model(
     return Qwen3VLGPTModel(
         config=provider,
         transformer_layer_spec=block_spec,
-        vocab_size=provider.vocab_size,
+        vocab_size=vocab_size,
         max_sequence_length=provider.seq_length,
         pre_process=True if pre_process is None else pre_process,
         post_process=True if post_process is None else post_process,
@@ -192,8 +235,15 @@ class EuroVLModelProvider(GPTModelProvider):
     # EuroLLM hidden_size.
     projector_output_dim: int = 2048
 
-    # Vision special tokens appended to EuroLLM's vocabulary (base vocab_size=128000).
-    # Vocab is padded to the next multiple of 128 → 128128.
+    # Explicit padded vocabulary size, honoured by _resolve_padded_vocab_size when
+    # `should_pad_vocab` is set. Pinning one value keeps a checkpoint's embedding shape identical
+    # across TP degrees; None falls back to Megatron's per-TP rule (a different size per TP).
+    # The recipes set EUROLLM_PADDED_VOCAB_SIZE (128512); see euro_vl/utils.py for the arithmetic.
+    padded_vocab_size: int | None = None
+
+    # Vision special tokens appended to EuroLLM's vocabulary (base vocab_size=128000), giving the
+    # real vocab_size=128005. Rows above that exist only when the vocab is padded for TP and are
+    # never emitted by the tokenizer.
     image_token_id: int = 128000  # <image>           — per-image-token placeholder
     vision_start_token_id: int = 128001  # <|vision_start|>  — block start delimiter
     vision_end_token_id: int = 128002  # <|vision_end|>    — block end delimiter

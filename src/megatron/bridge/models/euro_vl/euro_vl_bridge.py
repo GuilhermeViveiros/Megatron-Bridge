@@ -27,6 +27,9 @@ copy verbatim; only the Llama decoder needs the usual QKV/GatedMLP fusions.
 
 from typing import List
 
+import torch
+from transformers import AutoConfig, AutoModel
+
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
@@ -35,12 +38,11 @@ from megatron.bridge.models.conversion.param_mapping import (
     QKVMapping,
     ReplicatedMapping,
 )
-from transformers import AutoConfig, AutoModel
-
 from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider
 from megatron.bridge.models.euro_vl.modeling_euro_vl import EuroVLModel
 from megatron.bridge.models.euro_vl.modeling_euro_vl_hf import EuroVLForConditionalGeneration
+from megatron.bridge.models.euro_vl.utils import EUROLLM_PADDED_VOCAB_SIZE
 
 
 # Register the custom HF classes so AutoConfig/AutoModel can load assembled ``euro_vl``
@@ -106,6 +108,11 @@ class EuroVLBridge(MegatronModelBridge):
             # EuroLLM: standard 1D RoPE with the fused kernel.
             provider.apply_rope_fusion = True
             provider.position_embedding_type = "rope"
+            # EuroLLM's 128005 vocab is odd and cannot be split across TP ranks. Pad it to one
+            # TP-independent size so an imported checkpoint loads at TP=1/2/4 (see utils.py); the
+            # weight hooks below keep the HF side at its true 128005 rows.
+            provider.should_pad_vocab = True
+            provider.padded_vocab_size = EUROLLM_PADDED_VOCAB_SIZE
 
         # tie_word_embeddings lives on the TOP-LEVEL config (EuroLLM is untied).
         provider.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
@@ -121,6 +128,54 @@ class EuroVLBridge(MegatronModelBridge):
         provider.video_token_id = hf_config.video_token_id
 
         return provider
+
+    # Vocab-row keys that differ in size between HF (real vocab) and Megatron (padded for TP).
+    _VOCAB_HF_PARAMS = ("language_model.model.embed_tokens.weight", "language_model.lm_head.weight")
+
+    def _eurollm_padded_vocab_size(self) -> int | None:
+        """Padded vocab for the EuroLLM backbone, or None when padding does not apply.
+
+        Returns None for the Qwen3 backbone (vocab 151936 already splits across TP) and whenever
+        the HF config is unavailable, in which case the weights pass through untouched.
+        """
+        hf_config = getattr(self, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is None or getattr(text_config, "model_type", "llama") == "qwen3":
+            return None
+        return EUROLLM_PADDED_VOCAB_SIZE
+
+    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
+        """Zero-pad the embedding / output rows on import so they match the padded Megatron model.
+
+        The Megatron decoder is built with a padded vocabulary (128512) while the HF checkpoint
+        keeps the real one (128005), so these two tensors are the only ones whose row count
+        differs. Padding here means the generic ``ColumnParallelMapping`` sees matching shapes and
+        the shared conversion code needs no EuroVL special case.
+        """
+        hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+        padded = self._eurollm_padded_vocab_size()
+        if padded is None or not isinstance(hf_param, str) or hf_param not in self._VOCAB_HF_PARAMS:
+            return hf_weights
+        rows = hf_weights.shape[0]
+        if rows >= padded:
+            return hf_weights
+        pad = torch.zeros((padded - rows, *hf_weights.shape[1:]), dtype=hf_weights.dtype, device=hf_weights.device)
+        return torch.cat([hf_weights, pad], dim=0)
+
+    def maybe_modify_converted_hf_weight(self, task, converted_weights_dict, hf_state_dict):
+        """Drop the padding rows on export so the HF checkpoint matches its config's vocab_size.
+
+        Without this an exported checkpoint carries 128512-row embeddings against a config that
+        declares 128005, and ``transformers`` refuses to load it.
+        """
+        converted = super().maybe_modify_converted_hf_weight(task, converted_weights_dict, hf_state_dict)
+        if self._eurollm_padded_vocab_size() is None:
+            return converted
+        vocab_size = self.hf_config.text_config.vocab_size
+        return {
+            key: (value[:vocab_size] if key in self._VOCAB_HF_PARAMS and value.shape[0] > vocab_size else value)
+            for key, value in converted.items()
+        }
 
     def build_conversion_tasks(self, hf_pretrained, megatron_model) -> List[WeightConversionTask]:
         # Defensive: drop any unmapped (None) tasks so base iteration doesn't crash.

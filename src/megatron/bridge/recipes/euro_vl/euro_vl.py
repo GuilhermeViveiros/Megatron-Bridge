@@ -33,6 +33,7 @@ import torch
 from megatron.bridge.models.euro_vl.euro_vl_processor import EuroVLProcessor
 from megatron.bridge.models.euro_vl.euro_vl_provider import EuroVLModelProvider, Qwen3EuroVLModelProvider
 from megatron.bridge.models.euro_vl.moonvit import MoonViTConfig
+from megatron.bridge.models.euro_vl.utils import EUROLLM_PADDED_VOCAB_SIZE
 from megatron.bridge.recipes.common import _sft_common_vlm
 from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing
 from megatron.bridge.training.config import ConfigContainer
@@ -49,7 +50,10 @@ EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_2512_hf"
 # Megatron-format conversion of the above (via convert_checkpoints.py import). The training
 # loader only recognizes Megatron checkpoints for pretrained_checkpoint — pointing it at the
 # raw HF dir silently loads nothing (checkpoint_exists() is False -> random init).
-EUROVL_MCORE = f"{_SCRATCH}/megatron_models/euro_vl_2b_2512"
+# `_v128512`: vocab padded from 128005 to 128512 rows so the (odd) EuroLLM vocab can be split
+# across TP ranks; all other weights are byte-identical to euro_vl_2b_2512 (see
+# sanity_check/pad_vocab_checkpoint.py and euro_vl/utils.py).
+EUROVL_MCORE = f"{_SCRATCH}/megatron_models/euro_vl_2b_2512_v128512"
 # Root of the prepared Energon datasets (energon-data/). Static default; override per
 # launch with dataset.root=... or the EUROVL_ENERGON_ROOT env var.
 EUROVL_ENERGON_ROOT = os.environ.get("EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data")
@@ -87,6 +91,10 @@ def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
         # Pad the (odd) 128005 vocab up to a TP-divisible size; required for TP>1
         # (VocabParallelEmbedding splits vocab across TP ranks). Harmless at TP=1.
         should_pad_vocab=True,
+        # One pinned size instead of Megatron's per-TP rule, so a checkpoint saved at one TP
+        # degree loads at TP=1/2/4 (see euro_vl/utils.py). Checkpoints written before this was
+        # introduced hold 128005 rows and must be migrated (sanity_check/pad_vocab_checkpoint.py).
+        padded_vocab_size=EUROLLM_PADDED_VOCAB_SIZE,
         seq_length=32768,  # EuroLLM-1.7B-Instruct-2512 max_position_embeddings -> overrided to 8192 for the instruct training stage
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -304,7 +312,10 @@ def euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
     # Requires a PA checkpoint to already exist -- this stage continues from the projector PA
     # trained, not a random-init one. Raises rather than silently falling back to the
     # random-projector base checkpoint, which would make PA-vs-no-PA comparisons meaningless.
-    pa_run_dir = f"{EUROVL_RUNS}/eurollm_pa"
+    # `_v128512` holds the vocab-padded copy of the PA run (sanity_check/pad_vocab_checkpoint.py):
+    # the model is now built with a padded vocabulary, so the original 128005-row checkpoint no
+    # longer matches. Weights are otherwise byte-identical to eurollm_pa_v2/iter_0003720.
+    pa_run_dir = f"{EUROVL_RUNS}/eurollm_pa_v2_v128512"
     pa_checkpoint = f"{pa_run_dir}/iter_0003720/"
     if not os.path.exists(pa_checkpoint):
         raise FileNotFoundError(

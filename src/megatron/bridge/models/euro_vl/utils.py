@@ -27,6 +27,18 @@ import random
 # other.
 ATTEND_ALL_SUBSEGMENT_ID = 10000
 
+# EuroLLM's vocabulary is 128005 (128000 base + 5 vision specials), which is odd and therefore
+# cannot be split across tensor-parallel ranks (`VocabParallelEmbedding` shards the vocab rows, so
+# TP must divide it). Megatron's usual rule pads to a multiple of
+# `make_vocab_size_divisible_by * TP`, which yields a DIFFERENT size per TP degree (128128 at TP=1,
+# 128256 at TP=2, 128512 at TP=4) and therefore makes a saved checkpoint's embedding shape
+# TP-specific. We instead pin one size that already satisfies the rule for TP in {1, 2, 4}, so the
+# same checkpoint loads at any of those degrees: 128512 = 251 * 512, i.e. a whole number of 128-row
+# tiles per rank (128512/1 = 1004*128, /2 = 502*128, /4 = 251*128). Cost: 507 unused rows ~= 4 MB
+# and ~0.4% more output-layer FLOPs. The padded rows are never valid token ids (the tokenizer tops
+# out at 128004), so they are only ever extra output-layer logits.
+EUROLLM_PADDED_VOCAB_SIZE = 128512
+
 
 def format_timestamp(seconds: float, fmt: str = "seconds") -> str:
     """Format a frame timestamp as the inner text of a ``<...>`` marker (Qwen3-VL style).
