@@ -117,8 +117,12 @@ def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
 # =============================================================================
 # EuroVL 2B SFT Configuration
 # =============================================================================
-def _build_base_sft_config() -> ConfigContainer:
+def _build_base_sft_config(seq_length: int = 8192) -> ConfigContainer:
     """Shared builder for :func:`euro_vl_2b_sft_config` and :func:`euro_vl_2b_pa_sft_config`.
+
+    ``seq_length`` must be chosen here, not by a CLI override afterwards: the processor (whose
+    video token budget is a fraction of it), the task encoder (pack length) and the provider are
+    all built from it below. ``run_recipe.py --seq_length N`` passes it through.
 
     Model, parallel settings, kernels, real energon ``mixture.yaml`` blend, packing, and DDP --
     everything except which checkpoint to initialize from, since the two public configs disagree
@@ -152,11 +156,15 @@ def _build_base_sft_config() -> ConfigContainer:
     # Kernel selections
     cfg.model.attention_backend = "auto"
     cfg.model.cross_entropy_loss_fusion = True
-    cfg.model.cross_entropy_fusion_impl = "native"
+    # "te", not "native": benchmarked on one GH200 at EuroVL shapes (logits 8192x1x128005) the
+    # TE fused kernel is 5.29 ms vs 17.35 ms fwd+bwd and allocates 0 MiB of extra peak vs ~9.8 GiB,
+    # at identical numerics (both 1.91e-06 max abs err vs an fp32 reference). The native path
+    # materializes an fp32 copy of the logits, which is what OOM'd 16k training (7.81 GiB alloc).
+    cfg.model.cross_entropy_fusion_impl = "te"
 
     # Long context for the energon stage. Set before building the task encoder / provider
     # below so seq_length propagates to both (they read cfg.model.seq_length at build).
-    cfg.model.seq_length = 8192
+    cfg.model.seq_length = seq_length
 
     # Training config
     cfg.train.train_iters = 500
@@ -207,6 +215,14 @@ def _build_base_sft_config() -> ConfigContainer:
         # Mutually exclusive with pack_sequences_in_batch.
         packing_buffer_size=256,
         pack_sequences_in_batch=False,
+        # Do NOT let energon eagerly decode media: with auto_decode=False every sample reaches
+        # the task encoder as raw bytes, so _cook does bounded, native-resolution, on-demand
+        # decode (images via PIL; video via video_processor.decode_video_bytes -> only the
+        # policy-planned frame count) instead of energon decoding whole clips into RAM
+        # (~2.6 GB/clip -> OOM/slow buffer fill). Without it EVERY video sample raises
+        # "auto-decoded video has no fps for timestamps" in _frames_from_video and is dropped
+        # (measured: 62,788 failures / 0 iterations on a video-only mixture, job 1911843).
+        energon_dataset_kwargs={"auto_decode": False},
     )
 
     # Load the assembled EuroVL weights (EuroLLM + MoonViT; projector random). MUST be the
@@ -242,7 +258,7 @@ def _build_base_sft_config() -> ConfigContainer:
     return cfg
 
 
-def euro_vl_2b_sft_config() -> ConfigContainer:
+def euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
     """SFT config for EuroVL-2B (EuroLLM-1.7B-Instruct-2512 + MoonViT-SO-400M, M-RoPE) —
     all modules trainable, over a real Megatron-Energon (Crude) weighted blend.
 
@@ -283,7 +299,7 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
     Energon imports are local so the other EuroVL recipes do not require
     ``megatron-energon`` to be installed.
     """
-    cfg = _build_base_sft_config()
+    cfg = _build_base_sft_config(seq_length=seq_length)
 
     # Requires a PA checkpoint to already exist -- this stage continues from the projector PA
     # trained, not a random-init one. Raises rather than silently falling back to the
@@ -328,7 +344,7 @@ def euro_vl_2b_sft_config() -> ConfigContainer:
     return cfg
 
 
-def euro_vl_2b_pa_sft_config() -> ConfigContainer:
+def euro_vl_2b_pa_sft_config(seq_length: int = 8192) -> ConfigContainer:
     """EuroVL-2B (EuroLLM-1.7B-Instruct-2512 + MoonViT, M-RoPE) **projector-alignment (PA /
     stage-1)** config.
 
@@ -350,7 +366,7 @@ def euro_vl_2b_pa_sft_config() -> ConfigContainer:
             scripts/training/run_recipe.py --recipe euro_vl_2b_pa_sft_config --step_func vlm_step \\
             train.train_iters=2158 dataset.num_workers=8
     """
-    cfg = _build_base_sft_config()
+    cfg = _build_base_sft_config(seq_length=seq_length)
 
     # PA: freeze the pretrained LLM + vision tower; train only the projector.
     cfg.model.freeze_language_model = True
@@ -503,7 +519,7 @@ def qwen3_euro_vl_sft_energon_config() -> ConfigContainer:
     cfg.model.transformer_impl = "transformer_engine"
     cfg.model.attention_backend = "auto"
     cfg.model.cross_entropy_loss_fusion = True
-    cfg.model.cross_entropy_fusion_impl = "native"
+    cfg.model.cross_entropy_fusion_impl = "te"  # see _build_base_sft_config for the benchmark
 
     # Training config.
     cfg.train.train_iters = 500
@@ -777,7 +793,7 @@ def gemma_euro_vl_pa_sft_config() -> ConfigContainer:
     cfg.model.transformer_impl = "transformer_engine"
     cfg.model.attention_backend = "auto"
     cfg.model.cross_entropy_loss_fusion = True
-    cfg.model.cross_entropy_fusion_impl = "native"
+    cfg.model.cross_entropy_fusion_impl = "te"  # see _build_base_sft_config for the benchmark
 
     cfg.model.seq_length = 8192
 
