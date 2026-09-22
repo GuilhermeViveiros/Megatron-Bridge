@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from megatron.bridge.models.euro_vl.rope import get_rope_index
+from megatron.bridge.models.euro_vl.utils import ATTEND_ALL_SUBSEGMENT_ID
 
 
 IMAGE_TOKEN_ID = 200
@@ -75,9 +76,11 @@ class TestGetRopeIndex:
         img_placeholder = [IMAGE_TOKEN_ID] * 4
         tokens = (
             [TEXT_TOK, TEXT_TOK, TEXT_TOK]
-            + [VISION_START_TOKEN_ID] + img_placeholder
+            + [VISION_START_TOKEN_ID]
+            + img_placeholder
             + [TEXT_TOK, TEXT_TOK]
-            + [VISION_START_TOKEN_ID] + img_placeholder
+            + [VISION_START_TOKEN_ID]
+            + img_placeholder
             + [TEXT_TOK, TEXT_TOK, TEXT_TOK, TEXT_TOK]
         )
         input_ids = torch.tensor([tokens], dtype=torch.long)
@@ -105,7 +108,8 @@ class TestGetRopeIndex:
         img_placeholder = [IMAGE_TOKEN_ID] * 4
         doc_a = (
             [TEXT_TOK, TEXT_TOK, TEXT_TOK]
-            + [VISION_START_TOKEN_ID] + img_placeholder
+            + [VISION_START_TOKEN_ID]
+            + img_placeholder
             + [TEXT_TOK, TEXT_TOK, TEXT_TOK, TEXT_TOK]
         )
         doc_b = [TEXT_TOK, TEXT_TOK] + [VISION_START_TOKEN_ID] + img_placeholder + [TEXT_TOK]
@@ -130,4 +134,110 @@ class TestGetRopeIndex:
             pos[1, 0, doc_b_offset].item(),
             pos[2, 0, doc_b_offset].item(),
         )
-        assert first_tok_pos == (0, 0, 0), "second packed document must reset to (0, 0, 0), not continue from the first"
+        assert first_tok_pos == (0, 0, 0), (
+            "second packed document must reset to (0, 0, 0), not continue from the first"
+        )
+
+
+class TestMessageTreeBranchPositions:
+    """Message-tree packing: each branch restarts right after the shared prefix.
+
+    Mirrors Molmo2's ``build_subsegment_pos_ids`` (olmo/preprocessing/text_preprocessor.py):
+    branches are independent continuations of the same prefix, so branch 1 must not be pushed
+    further along the position axis just because branch 0 was laid out before it.
+    """
+
+    def _packed(self, prefix_len, branch_lens, seq_len):
+        input_ids = torch.full((1, seq_len), TEXT_TOK, dtype=torch.long)
+        sub = torch.full((seq_len,), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+        pos = prefix_len
+        for b, blen in enumerate(branch_lens):
+            sub[pos : pos + blen] = b
+            pos += blen
+        seqlens = [prefix_len + sum(branch_lens)]
+        if seqlens[0] < seq_len:
+            seqlens.append(seq_len - seqlens[0])
+        cu = torch.zeros(len(seqlens) + 1, dtype=torch.int32)
+        cu[1:] = torch.tensor(seqlens, dtype=torch.int32).cumsum(0)
+        return input_ids, cu, sub
+
+    def test_branches_start_at_the_same_position(self):
+        prefix, blens, seq_len = 6, [4, 4], 16
+        input_ids, cu, sub = self._packed(prefix, blens, seq_len)
+        pos = get_rope_index(input_ids, cu_seqlens=cu, subsegment_ids=sub)
+        # Text-only: all three axes agree, so inspect the temporal one.
+        t = pos[0, 0]
+        assert t[:prefix].tolist() == list(range(prefix))
+        assert t[prefix : prefix + 4].tolist() == [6, 7, 8, 9]
+        assert t[prefix + 4 : prefix + 8].tolist() == [6, 7, 8, 9], "branch 1 must restart"
+
+    def test_without_subsegment_ids_positions_run_through(self):
+        prefix, blens, seq_len = 6, [4, 4], 16
+        input_ids, cu, _ = self._packed(prefix, blens, seq_len)
+        t = get_rope_index(input_ids, cu_seqlens=cu)[0, 0]
+        assert t[:14].tolist() == list(range(14)), "no ids -> unchanged behaviour"
+
+    def test_flat_sample_in_the_same_pack_is_unaffected(self):
+        seq_len = 20
+        input_ids = torch.full((1, seq_len), TEXT_TOK, dtype=torch.long)
+        sub = torch.full((seq_len,), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+        sub[6:10] = 0
+        sub[10:14] = 1
+        cu = torch.tensor([0, 14, 20], dtype=torch.int32)
+        t = get_rope_index(input_ids, cu_seqlens=cu, subsegment_ids=sub)[0, 0]
+        assert t[14:].tolist() == list(range(6)), "flat sub-sequence still restarts at 0"
+
+    def test_subsegment_ids_without_cu_seqlens_raises(self):
+        input_ids = torch.full((1, 8), TEXT_TOK, dtype=torch.long)
+        sub = torch.full((8,), ATTEND_ALL_SUBSEGMENT_ID, dtype=torch.int32)
+        with pytest.raises(ValueError, match="requires cu_seqlens"):
+            get_rope_index(input_ids, subsegment_ids=sub)
+
+
+class TestBranchSpans:
+    """``_branch_spans`` must match a straightforward per-token scan on every layout."""
+
+    @staticmethod
+    def _reference(segment_ids, offset):
+        """The original per-token loop, kept as the specification."""
+        spans, start = [], None
+        for i, sid in enumerate(segment_ids):
+            is_branch = sid != ATTEND_ALL_SUBSEGMENT_ID
+            if is_branch and start is None:
+                start = i
+            elif start is not None and (not is_branch or sid != segment_ids[start]):
+                spans.append((offset + start, offset + i))
+                start = i if is_branch else None
+        if start is not None:
+            spans.append((offset + start, offset + len(segment_ids)))
+        return spans
+
+    @pytest.mark.parametrize(
+        "segment_ids,offset,expected",
+        [
+            ([], 0, []),  # empty sub-sequence
+            ([10000] * 5, 7, []),  # flat sample / pad: no branches
+            ([10000, 10000, 0, 0, 1, 1, 1], 0, [(2, 4), (4, 7)]),  # prefix + 2 branches
+            ([10000, 0, 1, 2], 512, [(513, 514), (514, 515), (515, 516)]),  # 1-token branches, offset
+            ([0, 0, 1], 0, [(0, 2), (2, 3)]),  # no prefix
+            ([10000, 0, 0, 10000, 10000], 0, [(1, 3)]),  # trailing attend-all closes the span
+        ],
+    )
+    def test_known_layouts(self, segment_ids, offset, expected):
+        from megatron.bridge.models.euro_vl.rope import _branch_spans
+
+        assert _branch_spans(segment_ids, offset) == expected
+
+    def test_matches_reference_on_random_trees(self):
+        import random
+
+        from megatron.bridge.models.euro_vl.rope import _branch_spans
+
+        rng = random.Random(0)
+        for _ in range(500):
+            ids = [ATTEND_ALL_SUBSEGMENT_ID] * rng.randint(0, 50)
+            for b in range(rng.randint(0, 25)):
+                ids += [b] * rng.randint(1, 20)
+            ids += [ATTEND_ALL_SUBSEGMENT_ID] * rng.randint(0, 3)
+            offset = rng.randint(0, 8192)
+            assert _branch_spans(ids, offset) == self._reference(ids, offset)

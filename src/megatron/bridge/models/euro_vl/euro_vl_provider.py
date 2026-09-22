@@ -18,6 +18,78 @@ from typing import Any, List, Optional
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 
+def _patch_core_attention_specs(block_spec: "Any") -> int:
+    """Swap every layer's ``core_attention`` for the branch-isolating variant.
+
+    Walks the same spec shapes as ``qwen35_vl_provider._patch_standard_attention_specs`` (a block
+    spec with ``layer_specs``, or a single ``ModuleSpec``, plus a nested MTP layer spec) and only
+    touches specs that actually have a ``self_attention.submodules.core_attention``.
+
+    Args:
+        block_spec: Transformer block spec (or one layer spec) to patch in place.
+
+    Returns:
+        Number of layer specs patched, so callers can assert the flag had an effect.
+    """
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    from megatron.bridge.models.euro_vl.branch_attention import BranchIsolatedDotProductAttention
+
+    if block_spec is None:
+        return 0
+    if hasattr(block_spec, "layer_specs"):
+        return sum(_patch_core_attention_specs(spec) for spec in block_spec.layer_specs)
+    if not isinstance(block_spec, ModuleSpec):
+        return 0
+
+    submodules = getattr(block_spec, "submodules", None)
+    if submodules is None:
+        return 0
+
+    patched = 0
+    if hasattr(submodules, "mtp_model_layer"):
+        patched += _patch_core_attention_specs(submodules.mtp_model_layer)
+
+    #     TransformerLayer
+    #  └─ self_attention: SelfAttention
+    #       ├─ linear_qkv        (Q/K/V projection)
+    #       ├─ core_attention: TEDotProductAttention   ← softmax(QKᵀ)·V, the only part that sees the mask (replace by BranchIsolatedDotProductAttention, built for message-tree protocol)
+    #       └─ linear_proj       (output projection)
+    attn_spec = getattr(submodules, "self_attention", None)
+    attn_submodules = getattr(attn_spec, "submodules", None) if attn_spec is not None else None
+    if attn_submodules is not None and hasattr(attn_submodules, "core_attention"):
+        attn_submodules.core_attention = BranchIsolatedDotProductAttention
+        patched += 1
+    return patched
+
+
+def _check_message_tree_support(provider: "Any") -> None:
+    """Reject parallel/runtime settings that would silently break message-tree branch isolation.
+
+    Runs before any spec is built, so misconfigurations fail fast. The branch mask spans the whole
+    packed sequence and rides on packed_seq_params: context parallelism shards q/k/v but not the
+    mask, and TE-scoped CUDA graphs drop packed_seq_params.
+
+    Args:
+        provider: Model provider; only checked when ``message_tree_attention`` is set.
+
+    Raises:
+        ValueError: If the flag is combined with context parallelism, CUDA graphs, attention dropout or
+            bidirectional image attention.
+    """
+    if not getattr(provider, "message_tree_attention", False):
+        return
+    if (getattr(provider, "context_parallel_size", 1) or 1) > 1:
+        raise ValueError("message_tree_attention does not support context_parallel_size > 1")
+    if getattr(provider, "cuda_graph_impl", "none") not in (None, "none"):
+        raise ValueError("message_tree_attention does not support CUDA graphs (cuda_graph_impl != 'none')")
+    # The FlexAttention path implements neither, so reject them here instead of at the first tree pack.
+    if (getattr(provider, "attention_dropout", 0.0) or 0.0) > 0.0:
+        raise ValueError("message_tree_attention requires attention_dropout == 0 (the recipes use 0.0)")
+    if getattr(provider, "use_bidirectional_image_attention", False):
+        raise ValueError("message_tree_attention does not support use_bidirectional_image_attention")
+
+
 def _build_mrope_gpt_model(
     provider: "Any",
     pre_process: Optional[bool],
@@ -26,6 +98,7 @@ def _build_mrope_gpt_model(
     patch_qk_norm: bool,
 ) -> "Any":
     """Build Qwen3-VL's interleaved-M-RoPE ``Qwen3VLGPTModel`` as a language backbone.
+
 
     Shared by every EuroVL M-RoPE provider (Qwen3, EuroLLM, ...) — ``Qwen3VLGPTModel`` and
     ``Qwen3VLSelfAttention`` are already config-driven (mrope_section, rotary_base,
@@ -43,7 +116,23 @@ def _build_mrope_gpt_model(
 
     assert provider.mrope_section is not None, f"{type(provider).__name__} requires mrope_section"
 
+    _check_message_tree_support(provider)
     block_spec = get_transformer_block_with_experimental_attention_variant_spec(provider, vp_stage=vp_stage)
+    if getattr(provider, "message_tree_attention", False):
+        from megatron.bridge.utils.common_utils import print_rank_0
+
+        n_patched = _patch_core_attention_specs(block_spec)
+        if n_patched == 0:
+            # Fail loudly: training on with the flag set but nothing patched would leave branches
+            # attending to each other while the run claims they are isolated.
+            raise RuntimeError(
+                "message_tree_attention=True but no layer spec has a core_attention slot to patch; "
+                "branch isolation would silently be off. Did the Megatron spec layout change?"
+            )
+        print_rank_0(
+            f"message_tree_attention=True: core_attention -> BranchIsolatedDotProductAttention "
+            f"in {n_patched} layer spec(s)"
+        )
     if patch_qk_norm:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
         from megatron.bridge.models.qwen_vl.qwen35_vl_provider import _patch_standard_attention_specs
@@ -85,9 +174,8 @@ class EuroVLModelProvider(GPTModelProvider):
     ``mrope_section=[24, 20, 20]`` sums to 64 = ``head_dim // 2`` (EuroLLM-1.7B's ``head_dim``
     is 128).
 
-    HF-side generation is NOT wired: ``Qwen3VLTextModel`` unconditionally allocates
-    ``q_norm``/``k_norm`` (verified: not gated on any config flag), so it cannot represent this
-    Llama backbone as-is. That only blocks HF export/inference, not Megatron training.
+    HF export/inference uses ``EuroVLTextForCausalLM`` (``modeling_euro_vl_hf``), the HF
+    counterpart of this backbone: ``Qwen3VLTextModel`` with its QK-norm swapped for identity.
     """
 
     # VLMs must not scatter embeddings across SP regions because image token
@@ -116,6 +204,14 @@ class EuroVLModelProvider(GPTModelProvider):
     # False (default): pure causal masking — simplest baseline.
     # True: bidirectional attention within each image's token block.
     use_bidirectional_image_attention: bool = False
+
+    # Message-tree branch isolation (docs/models/euro_vl/message-tree-packing.md). When True,
+    # every layer's core_attention is swapped for BranchIsolatedDotProductAttention: packs whose
+    # samples carry `subsegment_ids` run FlexAttention with the branch mask (each QA branch sees
+    # the shared video prefix and itself, never another branch), and every other pack keeps the
+    # untouched TE fused kernel. Opt-in: without it, tree samples train as plain multi-turn
+    # conversations, i.e. branches can read each other.
+    message_tree_attention: bool = False
 
     # Freeze flags for two-stage training.
     freeze_language_model: bool = False

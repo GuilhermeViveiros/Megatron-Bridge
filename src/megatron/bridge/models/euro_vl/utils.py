@@ -18,6 +18,16 @@ import math
 import random
 
 
+# Message-tree packing (docs/models/euro_vl/message-tree-packing.md): tokens of the shared prefix
+# (the media turn) carry this subsegment id and stay visible to every branch, while branch b
+# carries id b. The attention rule is `causal AND ids[q] <= ids[k]`, so a large sentinel makes the
+# prefix readable by all branches while branches stay invisible to each other. Same convention as
+# Molmo2 (olmo/preprocessing/text_preprocessor.py). Lives here so both the data path (task
+# encoder) and the model path (branch_attention, rope) can import it without depending on each
+# other.
+ATTEND_ALL_SUBSEGMENT_ID = 10000
+
+
 def format_timestamp(seconds: float, fmt: str = "seconds") -> str:
     """Format a frame timestamp as the inner text of a ``<...>`` marker (Qwen3-VL style).
 

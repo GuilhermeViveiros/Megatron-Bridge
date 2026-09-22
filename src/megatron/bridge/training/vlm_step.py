@@ -68,6 +68,11 @@ def get_batch_from_iterator(
     # Instead of raw tensors, expect a single 'visual_inputs' object in batch
     required_device_keys.add("visual_inputs")
 
+    # EuroVL message-tree packing: per-token branch ids used to build the branch-isolation
+    # attention mask (see models/euro_vl/branch_attention.py). Absent for every other model.
+    if batch.get("subsegment_ids") is not None:
+        required_device_keys.add("subsegment_ids")
+
     if "cu_seqlens" in batch:
         required_device_keys.add("cu_seqlens")
         required_host_keys.add("cu_seqlens_argmin")
@@ -261,7 +266,8 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
 
     Returns:
         tuple of tensors containing tokens, labels, loss_mask, attention_mask, position_ids,
-        cu_seqlens, cu_seqlens_argmin, max_seqlen, visual_inputs (container of optional modalities)
+        cu_seqlens, cu_seqlens_argmin, max_seqlen, visual_inputs (container of optional
+        modalities), subsegment_ids (EuroVL message-tree branch ids, None for every other model)
     """
     is_first = is_pp_first_stage(pg_collection.pp)
     is_last = is_pp_last_stage(pg_collection.pp)
@@ -401,6 +407,7 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
         cu_seqlens,
         max_seqlen,
         visual_inputs,
+        batch.get("subsegment_ids"),
     )
 
 
@@ -436,6 +443,7 @@ def forward_step(
             cu_seqlens,
             max_seqlen,
             visual_inputs,
+            subsegment_ids,
         ) = get_batch(data_iterator, state.cfg, use_mtp, pg_collection=pg_collection)
     timers("batch-generator").stop()
 
@@ -462,6 +470,10 @@ def forward_step(
         "labels": labels,
         "loss_mask": loss_mask,  # Pass full loss_mask so model can slice it consistently with labels
     }
+
+    # Only EuroVL's model accepts subsegment_ids; passing it to other VLMs would be a TypeError.
+    if subsegment_ids is not None:
+        forward_args["subsegment_ids"] = subsegment_ids
 
     if visual_inputs is not None:
         forward_args.update(visual_inputs.normalized_for_model())

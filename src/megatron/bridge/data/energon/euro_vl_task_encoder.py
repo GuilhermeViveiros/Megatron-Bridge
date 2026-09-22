@@ -58,6 +58,7 @@ from megatron.bridge.data.energon.task_encoder_utils import (
 )
 from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
+from megatron.bridge.models.euro_vl.utils import ATTEND_ALL_SUBSEGMENT_ID
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
@@ -77,10 +78,9 @@ _MULTI_IMAGE_RE = re.compile(r"^img(\d+)\.(?:jpg|jpeg|png)$")
 # mirroring the multi-image `img{i}` layout. A single-video sample uses a bare `mp4` part.
 _MULTI_VIDEO_RE = re.compile(r"^vid(\d+)\.(?:mp4|webm|mkv|mov|avi)$")
 
-# Message-tree samples: tokens of the shared prefix (the media turn) get this id and are visible to
-# every branch; branch b gets id b. Same convention as Molmo2
-# (olmo/preprocessing/text_preprocessor.py), whose mask is causal AND ids[q] <= ids[k].
-ATTEND_ALL_SUBSEGMENT_ID = 10000
+# Message-tree subsegment ids: re-exported from the model side so the encoder and the attention
+# mask cannot drift apart. See megatron.bridge.models.euro_vl.utils for the convention.
+__all__ = ["ATTEND_ALL_SUBSEGMENT_ID", "EuroVLTaskEncoder", "EuroVLTaskSample"]
 
 
 @dataclass
@@ -181,6 +181,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         # Register the cooker that decodes a crude sample into a ChatMLSample. A bound
         # method is picklable (the encoder itself is sent to dataloader workers).
         self.cookers = [Cooker(cook=self._cook)]
+        self._warned_unpacked_trees = False
 
     @staticmethod
     def _frame_to_pil(f) -> Image.Image:
@@ -371,7 +372,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         return encoded
 
     # ------------------------------------------------------------------
-    # Message-tree samples (docs/models/euro_vl/message_tree_packing.md)
+    # Message-tree samples (docs/models/euro_vl/message-tree-packing.md)
     #
     # One media prefix shared by several independent branches (e.g. QA pairs about the same
     # video), encoded once. Branch boundaries are recorded as per-token subsegment ids for the
@@ -602,6 +603,17 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         restart per sub-sequence (required for THD RoPE).
         """
         if not samples or not isinstance(samples[0], EuroVLPackedSample):
+            if not self._warned_unpacked_trees and any(
+                getattr(sample, "subsegment_ids", None) is not None for sample in samples
+            ):
+                # Only packed batches carry subsegment_ids to the model, so without energon packing
+                # branch isolation cannot apply: tree samples train as plain multi-turn chats.
+                logging.warning(
+                    "Message-tree samples in an unpacked batch: branch ids are dropped and branches "
+                    "can attend to each other. Enable energon packing (packing_buffer_size) for "
+                    "branch isolation."
+                )
+                self._warned_unpacked_trees = True
             return super().batch(samples)
 
         assert len(samples) == 1, (

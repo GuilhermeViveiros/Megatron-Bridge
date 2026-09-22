@@ -160,6 +160,47 @@ class EuroVLModel(MegatronModule):
         )
         return ~torch.logical_or(causal_mask, bidirectional.unsqueeze(1))
 
+    def _build_branch_mask(
+        self,
+        subsegment_ids: Optional[torch.Tensor],
+        packed_seq_params: Optional["PackedSeqParams"],
+    ):
+        """Build the message-tree ``BlockMask`` for this batch, or ``None``.
+
+        Returns ``None`` -- keeping today's TE fused kernel -- when the feature is off, when the
+        batch carries no ``subsegment_ids``, or when the pack happens to contain no branches.
+
+        Args:
+            subsegment_ids: ``[1, seq_len]`` ids from the task encoder, or ``None``.
+            packed_seq_params: THD metadata of this batch.
+
+        Returns:
+            A FlexAttention ``BlockMask``, or ``None``.
+        """
+        if not getattr(self.config, "message_tree_attention", False):
+            return None
+        from megatron.bridge.models.euro_vl.branch_attention import (
+            BranchIsolatedDotProductAttention,
+            build_branch_block_mask,
+            has_message_tree,
+        )
+
+        if not has_message_tree(subsegment_ids):
+            return None
+        # Fail loudly if nothing would consume the mask (e.g. a provider that builds the language
+        # model without the core_attention patch): otherwise branches would silently see each other
+        # while the run claims they are isolated. Checked once per model.
+        if not getattr(self, "_branch_attention_checked", False):
+            if not any(isinstance(m, BranchIsolatedDotProductAttention) for m in self.language_model.modules()):
+                raise RuntimeError(
+                    "message_tree_attention=True but the language model has no BranchIsolatedDotProductAttention "
+                    "layers; this provider does not support branch isolation."
+                )
+            self._branch_attention_checked = True
+        if packed_seq_params is None:
+            raise ValueError("message-tree batches must be packed (THD); got no packed_seq_params")
+        return build_branch_block_mask(subsegment_ids, packed_seq_params.cu_seqlens_q)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -175,6 +216,7 @@ class EuroVLModel(MegatronModule):
         packed_seq_params: Optional["PackedSeqParams"] = None,
         *,
         loss_mask: Optional[Tensor] = None,
+        subsegment_ids: Optional[torch.Tensor] = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Forward pass combining MoonViT vision encoding with EuroLLM language model.
 
@@ -247,6 +289,20 @@ class EuroVLModel(MegatronModule):
         else:
             attention_mask = None
 
+        # Message-tree branch isolation: build the FlexAttention BlockMask once per micro-batch and
+        # attach it to this micro-batch's packed_seq_params, which reaches every layer's
+        # core_attention (and, unlike `attention_mask`, survives activation recompute). Packs
+        # without branches get no mask and keep the TE fused kernel. See branch_attention.py.
+        if subsegment_ids is not None and input_ids is not None and subsegment_ids.shape[-1] != input_ids.shape[-1]:
+            raise ValueError(f"subsegment_ids length {subsegment_ids.shape[-1]} != token length {input_ids.shape[-1]}")
+        branch_mask = self._build_branch_mask(subsegment_ids, packed_seq_params)
+        if packed_seq_params is not None and getattr(self.config, "message_tree_attention", False):
+            from megatron.bridge.models.euro_vl.branch_attention import attach_branch_mask
+
+            # Always (re)set, None included: a mask must never outlive the micro-batch it was
+            # built for, even if a caller reuses the same PackedSeqParams object.
+            attach_branch_mask(packed_seq_params, branch_mask)
+
         inputs_embeds, labels, loss_mask, position_ids, attention_mask = slice_batch_for_context_parallel(
             inputs_embeds=inputs_embeds,
             labels=labels,
@@ -303,6 +359,7 @@ class Qwen3EuroVLModel(EuroVLModel):
         packed_seq_params: Optional["PackedSeqParams"] = None,
         *,
         loss_mask: Optional[Tensor] = None,
+        subsegment_ids: Optional[torch.Tensor] = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Compute 3D M-RoPE position ids, then run the shared EuroVL forward.
 
@@ -314,6 +371,11 @@ class Qwen3EuroVLModel(EuroVLModel):
         from megatron.bridge.models.euro_vl.rope import get_rope_index
 
         cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None) if packed_seq_params is not None else None
+        # Per-branch position reset and branch-isolated attention must switch together: resetting
+        # positions while branches can still attend to each other would give two visible tokens
+        # the same position. With the flag off, tree samples keep continuous positions and plain
+        # causal attention, i.e. they train as an ordinary multi-turn conversation.
+        tree_ids = subsegment_ids if getattr(self.config, "message_tree_attention", False) else None
         # MoonViT spatial merge factor (merge_kernel_size=[2,2] -> 2).
         merge_cfg = getattr(self.config.vision_config, "merge_kernel_size", 2)
         spatial_merge_size = merge_cfg[0] if isinstance(merge_cfg, (list, tuple)) else merge_cfg
@@ -322,6 +384,7 @@ class Qwen3EuroVLModel(EuroVLModel):
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             cu_seqlens=cu_seqlens,
+            subsegment_ids=tree_ids,
             spatial_merge_size=spatial_merge_size,
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
@@ -340,4 +403,5 @@ class Qwen3EuroVLModel(EuroVLModel):
             runtime_gather_output=runtime_gather_output,
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
+            subsegment_ids=subsegment_ids,
         )

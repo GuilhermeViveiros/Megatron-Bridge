@@ -29,7 +29,10 @@ validated in isolation first.
 
 from typing import Optional
 
+import numpy as np
 import torch
+
+from megatron.bridge.models.euro_vl.utils import ATTEND_ALL_SUBSEGMENT_ID
 
 
 def _document_positions(
@@ -79,8 +82,16 @@ def _document_positions(
     st = 0
     remain_images, remain_videos = image_nums, video_nums
     for _ in range(image_nums + video_nums):
-        ed_image = input_tokens.index(image_token_id, st) if (image_token_id in input_tokens and remain_images > 0) else len(input_tokens) + 1
-        ed_video = input_tokens.index(video_token_id, st) if (video_token_id in input_tokens and remain_videos > 0) else len(input_tokens) + 1
+        ed_image = (
+            input_tokens.index(image_token_id, st)
+            if (image_token_id in input_tokens and remain_images > 0)
+            else len(input_tokens) + 1
+        )
+        ed_video = (
+            input_tokens.index(video_token_id, st)
+            if (video_token_id in input_tokens and remain_videos > 0)
+            else len(input_tokens) + 1
+        )
         if ed_image < ed_video:
             t, h, w = image_grid_thw[image_index]
             image_index += 1
@@ -116,12 +127,38 @@ def _document_positions(
     return positions, image_index, video_index
 
 
+def _branch_spans(segment_ids: list[int], offset: int) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` absolute spans of each branch inside one packed sub-sequence.
+
+    Args:
+        segment_ids: Subsegment ids of the sub-sequence, in order.
+        offset: Index of the sub-sequence's first token in the packed sequence.
+
+    Returns:
+        One span per branch, in order; empty when the sub-sequence has no branches (a flat
+        sample, whose tokens are all ``ATTEND_ALL_SUBSEGMENT_ID``).
+    """
+    ids = np.asarray(segment_ids)
+    if ids.size == 0:
+        return []
+    # Split into runs of equal id (a new run starts wherever the id changes), then keep the runs
+    # that are branches. Python work is per run (branches + prefix), not per token.
+    cuts = np.flatnonzero(ids[1:] != ids[:-1]) + 1
+    bounds = np.concatenate(([0], cuts, [ids.size]))
+    return [
+        (offset + int(start), offset + int(end))
+        for start, end in zip(bounds[:-1], bounds[1:])
+        if ids[start] != ATTEND_ALL_SUBSEGMENT_ID
+    ]
+
+
 def get_rope_index(
     input_ids: torch.Tensor,
     image_grid_thw: Optional[torch.Tensor] = None,
     video_grid_thw: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
+    subsegment_ids: Optional[torch.Tensor] = None,
     *,
     spatial_merge_size: int = 2,
     image_token_id: int = 128000,
@@ -151,6 +188,11 @@ def get_rope_index(
             Set this for the THD-packed path; leave ``None`` for a plain/padded batch.
         attention_mask: ``[B, S]`` 1/0 validity mask for the plain/padded path. Ignored
             when ``cu_seqlens`` is set (the pad segment carries the padding instead).
+        subsegment_ids: ``[S]`` or ``[1, S]`` message-tree ids (``ATTEND_ALL_SUBSEGMENT_ID`` on
+            the shared prefix, ``b`` on branch ``b``). When given, every branch of a packed
+            sub-sequence restarts at the position right after that sub-sequence's shared prefix,
+            so a branch sees the positions it would have had on its own. Requires ``cu_seqlens``
+            (message-tree samples always arrive packed).
         spatial_merge_size: MoonViT spatial merge factor (2 for EuroVL).
         image_token_id: Image placeholder token id.
         video_token_id: Video placeholder token id.
@@ -187,13 +229,31 @@ def get_rope_index(
         )
         return pos.to(position_ids.device)
 
+    sub_ids = subsegment_ids.flatten().tolist() if subsegment_ids is not None else None
+    if sub_ids is not None and cu_seqlens is None:
+        raise ValueError("subsegment_ids requires cu_seqlens: message-tree samples arrive packed")
+
     if cu_seqlens is not None:
         assert B == 1, f"THD packing expects batch size 1, got {B}"
         bounds = cu_seqlens.tolist()
         for a, b in zip(bounds[:-1], bounds[1:]):
             if b <= a:
                 continue
-            position_ids[:, 0, a:b] = _doc(input_ids[0, a:b].tolist())
+            spans = (
+                _branch_spans(sub_ids[a:b], a) if sub_ids is not None else None
+            )  # only triggers for message-tree samples
+            if not spans:
+                position_ids[:, 0, a:b] = _doc(input_ids[0, a:b].tolist())
+                continue
+            # Shared prefix first (it holds the video, so it consumes the grid rows), then every
+            # branch restarts right after it -- Molmo2's build_subsegment_pos_ids, adapted to
+            # M-RoPE's (t, h, w) triples.
+            prefix_end = spans[0][0]
+            prefix_pos = _doc(input_ids[0, a:prefix_end].tolist())
+            position_ids[:, 0, a:prefix_end] = prefix_pos
+            branch_base = int(prefix_pos.max()) + 1 if prefix_pos.numel() else 0
+            for start, end in spans:
+                position_ids[:, 0, start:end] = _doc(input_ids[0, start:end].tolist()) + branch_base
     else:
         for i in range(B):
             if attention_mask is not None:

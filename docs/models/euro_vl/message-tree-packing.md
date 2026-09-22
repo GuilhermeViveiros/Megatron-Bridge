@@ -1,8 +1,8 @@
 # EuroVL: message-tree packing for multi-annotation video data
 
 Design notes for the technical report. Records what we decided, what we measured, and which
-alternatives we rejected and why. Status: data format decided and piloted; model/cooker
-implementation in progress.
+alternatives we rejected and why. Status: data format, encoder and branch-isolated attention
+implemented (attention opt-in via `model.message_tree_attention`); multi-GPU validation pending.
 
 ## Problem
 
@@ -203,14 +203,96 @@ Both weightings are heuristics with no published ablation (Molmo2's paper does n
 all), so the plan is to measure per-dataset answer-token shares first and treat √B as a separate
 experiment.
 
-Position ids still run continuously through all branches. Molmo2 restarts them for every branch
-after the shared prefix (`build_subsegment_pos_ids`), so each branch sees the positions it would
-have alone; this goes with the phase-2 mask (EuroVL's M-RoPE ids are computed in the model, so the
-reset has to be done there).
+Position ids restart per branch: `get_rope_index(..., subsegment_ids=...)` gives every branch the
+M-RoPE positions it would have had alone, continuing from the end of the shared prefix (Molmo2's
+`build_subsegment_pos_ids`, adapted to (t, h, w) triples). Passing the ids is what enables it, so
+runs without the flag keep the old continuous numbering.
 
-Until the phase-2 mask exists, branches in one sequence can attend to each other, i.e. they
-train like an ordinary multi-turn conversation. That is acceptable for independent QA; datasets
-whose branches are translations of one caption should wait for the mask.
+With `message_tree_attention=false` (the default) branches in one sequence still attend to each
+other, i.e. they train like an ordinary multi-turn conversation. That is tolerable for independent
+QA; datasets whose branches are translations of one caption need the flag on.
+
+## Branch-isolated attention (phase 2)
+
+### Kernel choice
+
+The rule is `causal AND same packed sample AND subsegment_ids[q] <= subsegment_ids[k]`. Transformer
+Engine cannot express it on a fused kernel: `attn_mask_type="arbitrary"` disables both FlashAttention
+and FusedAttention and falls back to an unfused backend that materialises `[b, h, S, S]` scores
+(~2.1 GB per layer at S=8192, ~51 GB over 24 layers). Every alternative was benchmarked on one GH200
+at the real shape (S=8192, 16 heads / 8 KV groups, head_dim 128, bf16, forward+backward per layer):
+
+| Kernel | ms | Peak MiB | Isolation |
+|---|---|---|---|
+| TE THD causal (baseline) | 2.08 | 417 | no |
+| **FlexAttention + `mask_mod`** | **2.76** | 385 | yes |
+| FlexAttention, isolation off | 2.64 | 385 | no |
+| FA2 prefix/branch split + LSE merge | 3.69 | 460 | yes (forward only; needs custom autograd) |
+| torch SDPA + bool mask (Molmo2's choice) | 6.90 | 577 | yes |
+| TE BSHD + cuDNN `post_scale_bias` | 7.90 | 2593 | yes |
+
+Isolation itself costs 0.12 ms; switching kernel costs 0.56 ms. At the step level (≈1,030 ms
+compute-bound at the production rate) that is ≈1.6% on tree packs and ≈0.3% overall with per-pack
+dispatch. Flex compiles once: 14 different masks produced a single compiled graph (0.9 ms/call).
+
+### How it is wired
+
+- `BranchIsolatedDotProductAttention` **subclasses** `TEDotProductAttention` and is swapped into every
+  layer's `core_attention` by a spec patch when the flag is on. Packs without a tree call
+  `super().forward` (the untouched TE kernel). State-dict keys are identical with the flag on or off.
+- `EuroVLModel.forward` builds one FlexAttention `BlockMask` per micro-batch and attaches it to that
+  micro-batch's `packed_seq_params` (always, `None` for tree-free packs). It deliberately does **not**
+  travel through `attention_mask`: Megatron's activation checkpointing passes `attention_mask` to
+  `ctx.save_for_backward`, which rejects a non-tensor, while `packed_seq_params` is captured by
+  closure in both the selective and the full recompute paths.
+- Per-branch position reset (M-RoPE) happens only when the flag is on, so mask and positions always
+  switch together.
+
+### Supported configurations
+
+| Setting | Behaviour with the flag on |
+|---|---|
+| TP, SP, PP, DP, distributed optimizer | supported (traced in code; multi-GPU runs queued) |
+| Activation recompute (selective, full) | supported; backward isolation verified |
+| Context parallelism > 1 | rejected at build: CP shards q/k/v but not the mask |
+| CUDA graphs | rejected at build: TE-scoped graphs drop `packed_seq_params` |
+| Attention dropout > 0, bidirectional image attention | rejected at build: not implemented on the Flex path |
+| Provider without the spec patch (e.g. Gemma) | raises at the first tree pack |
+| Unpacked batches | warning: `subsegment_ids` are dropped, branches see each other |
+
+### Validation
+
+- **Isolation, forward:** perturbing branch 0 leaves every other branch bit-identical (24 branches,
+  two trees plus a flat sample in one pack, an 800-token branch, a single-branch tree).
+- **Isolation, backward:** gradients of a loss on branch 1 are bit-identical when branch 0 changes,
+  with no recompute, selective recompute and full recompute (delta 0.0; 0.75 with the flag off).
+- **Equivalence oracle:** every branch of a tree reproduces `prefix + branch` encoded as an ordinary
+  flat sample to bf16 kernel tolerance (≤1.6e-2); with the flag off later branches drift 0.12–0.20.
+- **Checkpoint compatibility:** identical state-dict keys with the flag on or off.
+- **Data:** 160 real `eurovideolm_packed` groups encoded with 0 errors; lengths equal
+  `meta.rendered_tokens`; every branch's supervised tokens decode to exactly its answer.
+
+### Bugs found by review and stress testing (all fixed)
+
+1. Activation recompute crashed on tree packs (mask passed through `save_for_backward`).
+2. The flag changed checkpoint keys (wrapper instead of subclass).
+3. The Flex layout assumed `[s, 1, h, d]`; THD passes `[t, h, d]` (broke at one head per rank).
+4. A mask could outlive its micro-batch if a `PackedSeqParams` object was reused.
+5. Positions were reset per branch even with the flag off (visible branches sharing positions).
+6. Misconfigurations (CP, CUDA graphs, dropout, unpatched providers) failed silently.
+7. Unrelated but found on the way: the EuroLLM recipes auto-decoded video (`auto_decode` unset), so
+   every video sample raised "no fps" and was dropped.
+
+### Open points
+
+- **Branch sharing depends on answer length (expected, not a bug).** The first converted dataset,
+  `eurovideolm_packed`, is long-caption data (51–1,323 answer tokens per branch), so groups
+  average 1.16 branches (84% single-branch): with the video at ~85% of `seq_length`, only one or two
+  long captions fit. Short-answer QA datasets (~70 tokens, 7–8 per clip) fill a group with many
+  branches, which is where encode-once pays off; re-check the branch-count histogram per dataset as
+  they are converted.
+- **16K** needs a recipe change: `seq_length` is fixed before the processor and encoder are built.
+- Multi-GPU runs (TP=2/4, TP+SP, PP=2, DP=4) are queued.
 
 ## References
 
@@ -233,6 +315,15 @@ Molmo2 (`allenai/molmo2`, commit f3cb108):
       video tokens appear once and lie in the shared prefix; every branch's supervised tokens
       decode to exactly its answer; lengths equal `meta.rendered_tokens`.
 - [x] Over-length handling: drop branches rather than the whole sample; skip only if nothing fits.
-- [ ] Subsegment attention mask and per-branch position reset. Open risk: Transformer Engine's `arbitrary` mask combined with
-      THD `cu_seqlens` runs only on the unfused backend (O(T²)); verify on the pinned TE version.
+- [x] Subsegment attention mask and per-branch position reset (phase 2, opt-in via
+      `model.message_tree_attention=true`). TE cannot express the rule on a fused kernel
+      (`attn_mask_type="arbitrary"` drops to the unfused backend: ~2.1 GB of scores per layer at
+      8K), so a custom `core_attention` runs **FlexAttention** with a compiled `mask_mod`, and
+      falls back to the untouched TE kernel for packs without a tree. Measured on 1 GH200
+      (S=8192, 16 heads, fwd+bwd per layer): TE causal 2.08 ms -> flex+isolation 2.76 ms, i.e.
+      ~1.6% of a step; isolation itself is only 0.12 ms of that. Verified numerically: perturbing
+      branch 0's tokens leaves branch 1's logits bit-identical with the flag on (delta 0.0) and
+      moves them by 0.15 with it off, while a tree-free pack is bit-identical either way. See
+      [Branch-isolated attention](#branch-isolated-attention-phase-2) for design and validation.
+- [ ] Multi-GPU validation (TP=2/4, TP+SP, PP=2, DP=4) and 16K context: queued / recipe change.
 - [ ] Measurements for the report: throughput and vision-tower time, flat vs message-tree.

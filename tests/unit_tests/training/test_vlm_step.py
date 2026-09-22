@@ -252,6 +252,7 @@ def test_get_batch_enable_packing_path(monkeypatch):
         cu_seqlens,
         max_seqlen,
         visual_inputs,
+        _subsegment_ids,
     ) = get_batch(it, cfg, use_mtp=False, pg_collection=_MockPGCollection())
 
     # Verify packing occurred
@@ -333,7 +334,7 @@ def test_get_batch_enable_packing_with_cp(monkeypatch):
     it = _Iterator(batch)
 
     # Use CP size of 2
-    out_tokens, out_labels, out_loss_mask, _, out_position_ids, cu_seqlens, max_seqlen, _ = get_batch(
+    out_tokens, out_labels, out_loss_mask, _, out_position_ids, cu_seqlens, max_seqlen, _, _ = get_batch(
         it, cfg, use_mtp=False, pg_collection=_MockPGCollection(cp_size=2)
     )
 
