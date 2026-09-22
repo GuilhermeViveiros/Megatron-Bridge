@@ -216,6 +216,36 @@ asserts `t_index=0` + timestamp-base-advance. **Uncommitted in the working tree*
   vision **unfreezes (SFT)**, switch: have `_decode_video_bytes` return the sampled frames as a `[N,C,H,W]`
   tensor batch and feed `MoonViTVideoProcessor.vectorized_preprocess` (ties into #12) — no PIL, all frames
   processed together. `auto_decode=False` already gives us that control (we decode N frames ourselves).
+- **#31 Trim trailing text instead of skipping overflowing samples** (user request 2026-09-21). Today a
+  sample whose length exceeds `seq_length` is dropped whole (`SkipSample`, flat path
+  `hf_encoder_task_encoder.py:281-290` gated by `skip_on_truncation`; message-tree path
+  `euro_vl_task_encoder.py:461-470`). Change: if the overflow comes from **more than X text tokens after
+  the vision block**, trim that text instead of discarding the sample. `X` must be an explicit config
+  value (no arbitrary default).
+  - **How video tokens are bounded** (measured on the 8K recipe):
+    - Pixel budget: the processor spends a fixed `total_pixels = 5,457,038` across sampled frames; /784
+      (28x28) px per token = **at most ~6,960 visual tokens** = 85% of 8,192, the design target.
+    - Frames: the 64-frame cap only binds for clips > 64 s. A 46 s clip gets 46 frames with more tokens
+      each, so the total is the same -> the overflowing clips were not the longest ones.
+    - Per-frame overhead: each frame also carries a timestamp + `<|vision_start|>`/`<|vision_end|>`.
+      Measured max video block = **7,505-7,541 tokens**, ~545 above 6,960, i.e. ~8.5 tokens/frame over 64
+      frames (*inferred from the numbers, not counted directly*). **The 85% design figure omits this.**
+    - Worst case: a video block reaches ~7,500 tokens, leaving **~690 tokens for text**.
+  - **Why `activity_net_1` overflows (~10%)**: its question is a fixed ~1,000-token class list. A clip
+    using the full pixel budget = 7,200-7,530 video tokens + ~1,000 text = 8.2-8.5K. Clips with smaller
+    native resolution use less budget (mean 6,562) and fit.
+  - **Hard constraints for the trim**:
+    1. Never cut inside a vision block: placeholder count must equal the vision features (the
+       `masked_scatter` contract; cf. the pixel_values-by-patch-count truncation fix).
+    2. Never cut answer / loss tokens -- that is exactly why skip exists (answerless completions).
+    3. Only trim non-loss, user-turn text after the vision block.
+    4. Option-list questions (activity_net_1's class list): trimming can drop the **correct** class and
+       teach the model to answer with an option it was never shown. Keep the gold option (e.g. trim other
+       options first) or skip.
+  - **Alternative worth weighing first**: size the video budget per sample as
+    `seq_length - text_tokens - margin` instead of a flat 85%. Text-heavy samples then get fewer frames
+    / lower resolution and keep their question intact -- no semantic risk, and it also absorbs the
+    unaccounted ~8.5 tok/frame overhead.
 
 ---
 
