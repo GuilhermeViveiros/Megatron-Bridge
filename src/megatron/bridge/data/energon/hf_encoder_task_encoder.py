@@ -83,6 +83,11 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         skip_on_truncation: When True, raise ``SkipSample`` instead of truncating any sample
             whose natural length exceeds ``seq_length``. Off by default (existing behavior:
             truncate and warn); ``EuroVLTaskEncoder`` opts in.
+        min_answer_tokens_after_trim: Only with ``skip_on_truncation``. When set, an overflowing
+            sample whose cut falls inside its FINAL assistant answer is truncated instead of
+            skipped, provided at least this many answer tokens survive. The closing template
+            tokens (``<|im_end|>``...) go with the cut, so the model never learns to stop
+            mid-answer. ``None`` (default) keeps plain skip-on-overflow.
     """
 
     def __init__(
@@ -93,8 +98,17 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         min_pixels: Optional[int] = None,
         max_pixels: Optional[int] = None,
         skip_on_truncation: bool = False,
+        min_answer_tokens_after_trim: int | None = None,
     ):
         super().__init__()
+        if min_answer_tokens_after_trim is not None:
+            if not skip_on_truncation:
+                raise ValueError(
+                    "min_answer_tokens_after_trim only applies with skip_on_truncation=True "
+                    "(without it every overflowing sample is truncated anyway)"
+                )
+            if min_answer_tokens_after_trim <= 0:
+                raise ValueError(f"min_answer_tokens_after_trim must be positive, got {min_answer_tokens_after_trim}")
         self.processor = processor
         self.seq_length = seq_length
         self.visual_keys: Tuple[str, ...] = tuple(visual_keys)
@@ -106,6 +120,13 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         # by default so existing HF-encoder VLMs (Gemma3-VL, Ministral3, GLM-4.5V) keep their
         # current truncate-and-warn behavior; EuroVLTaskEncoder opts in.
         self.skip_on_truncation = skip_on_truncation
+        # Exception to skip_on_truncation: when the overflow lies inside the final answer, cut the
+        # answer's tail instead of dropping the sample. Every kept token is still the true next
+        # token given the full, untouched video + question, so this never teaches anything false
+        # (unlike trimming the question, which can drop the option the answer refers to). A
+        # 2026-09 census found ~7% of 8K overflow is of this kind, all in long-answer datasets
+        # (dense captions, document conversions); the rest overflows on the input side.
+        self.min_answer_tokens_after_trim = min_answer_tokens_after_trim
 
     # ------------------------------------------------------------------
     # Helpers
@@ -159,6 +180,60 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
             else:
                 i += 1
         return blocks
+
+    def _build_loss_mask(self, input_ids_np: np.ndarray, conversation: List[Dict]) -> np.ndarray:
+        """Per-token 0/1 mask over ``input_ids_np`` marking assistant-answer tokens.
+
+        Runs on the full, untruncated sequence. The default searches each assistant answer's
+        standalone tokenization; override it when a tokenizer renders answers differently in
+        context (e.g. SentencePiece dropping the leading ``▁`` after a newline).
+
+        Args:
+            input_ids_np: Token ids of the whole rendered conversation.
+            conversation: The normalized conversation (assistant turns carry string content).
+
+        Returns:
+            A float32 array of the same length, 1.0 on supervised tokens.
+        """
+        loss_mask_np = np.zeros(len(input_ids_np), dtype=np.float32)
+        search_start = 0
+        for turn in conversation:
+            if turn["role"] == "assistant":
+                answer_tokens = self._tokenizer.encode(turn["content"], add_special_tokens=False)
+                ans_start, ans_end = find_pattern_indices(input_ids_np, answer_tokens, search_start)
+                if ans_start >= 0:
+                    loss_mask_np[ans_start:ans_end] = 1.0
+                    search_start = ans_end
+        return loss_mask_np
+
+    @staticmethod
+    def _final_answer_span(loss_mask_np: np.ndarray) -> Tuple[int, int]:
+        """``(start, end)`` of the last contiguous run of supervised tokens, i.e. the final answer.
+
+        Returns ``(-1, -1)`` when nothing is supervised, which makes the trim rule skip.
+        """
+        supervised = np.flatnonzero(loss_mask_np > 0)
+        if supervised.size == 0:
+            return (-1, -1)
+        end = int(supervised[-1]) + 1
+        start = end - 1
+        while start > 0 and loss_mask_np[start - 1] > 0:
+            start -= 1
+        return (start, end)
+
+    @staticmethod
+    def _kept_final_answer_tokens(final_answer_span: Tuple[int, int], max_len: int) -> int:
+        """Answer tokens that survive truncating at ``max_len``, or 0 if trimming is not allowed.
+
+        Returns 0 -- i.e. "skip" -- when the final answer was not located, or when the cut would
+        start before it (reaching into the question or the media, which the trim never touches).
+        A cut that lands after the answer removes only closing template tokens and keeps the
+        whole answer.
+        """
+        start, end = final_answer_span
+        if start < 0 or max_len <= start:
+            return 0
+        return min(max_len, end) - start
 
     # ------------------------------------------------------------------
     # encode_sample
@@ -251,17 +326,11 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         else:
             input_ids_np = input_ids_t.numpy()
 
-        # 5. Build loss mask: only supervise assistant content
-        loss_mask_np = np.zeros(len(input_ids_np), dtype=np.float32)
-        search_start = 0
-        for turn in conversation:
-            if turn["role"] == "assistant":
-                answer = turn["content"]
-                answer_tokens = self._tokenizer.encode(answer, add_special_tokens=False)
-                ans_start, ans_end = find_pattern_indices(input_ids_np, answer_tokens, search_start)
-                if ans_start >= 0:
-                    loss_mask_np[ans_start:ans_end] = 1.0
-                    search_start = ans_end
+        # 5. Build loss mask: only supervise assistant content. Done on the FULL sequence, before
+        #    any truncation, so an answer later cut by the trim rule (6b) is still located and its
+        #    kept part stays supervised; subclasses swap the search via _build_loss_mask.
+        loss_mask_np = self._build_loss_mask(input_ids_np, conversation)
+        final_answer_span = self._final_answer_span(loss_mask_np)
 
         # 6. Labels = left-shifted input_ids; positions without valid label get IGNORE_INDEX
         labels_np = np.full(len(input_ids_np), IGNORE_INDEX, dtype=np.int64)
@@ -278,16 +347,29 @@ class HFEncoderVLMTaskEncoder(DefaultTaskEncoder[ChatMLSample, HFEncoderTaskSamp
         #     concludes "Final Answer: D" at the very end) -- with packing filling the slot
         #     from another real sample either way, skipping costs nothing but avoids teaching
         #     answerless, truncated completions.
+        #     Exception (min_answer_tokens_after_trim): if the cut starts inside the FINAL answer
+        #     and enough of that answer survives, truncate instead -- step 7 then drops the tail
+        #     together with the closing <|im_end|>, and the label shift makes the last kept
+        #     position predict the true next answer token rather than an end-of-turn.
         max_len = self.seq_length
         if self.skip_on_truncation and len(input_ids_np) > max_len:
-            logging.warning(
-                "Skipping sample %s: pre-truncation length %d exceeds seq_length=%d; "
-                "truncating would risk cutting off the answer.",
+            kept_answer_tokens = self._kept_final_answer_tokens(final_answer_span, max_len)
+            if self.min_answer_tokens_after_trim is None or kept_answer_tokens < self.min_answer_tokens_after_trim:
+                logging.warning(
+                    "Skipping sample %s: pre-truncation length %d exceeds seq_length=%d; "
+                    "truncating would risk cutting off the answer.",
+                    sample.__key__,
+                    len(input_ids_np),
+                    max_len,
+                )
+                raise SkipSample()
+            logging.info(
+                "Trimming final answer of sample %s: length %d -> %d, keeping %d answer tokens.",
                 sample.__key__,
                 len(input_ids_np),
                 max_len,
+                kept_answer_tokens,
             )
-            raise SkipSample()
 
         # 7. Truncate
         input_ids_pre_trunc = input_ids_np

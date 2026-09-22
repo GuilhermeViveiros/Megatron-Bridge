@@ -210,6 +210,11 @@ def _build_base_sft_config(seq_length: int = 8192) -> ConfigContainer:
         processor=processor,
         seq_length=cfg.model.seq_length,
         sqrt_loss_weighting=True,
+        # Overflow that falls inside the final answer is trimmed instead of skipped when >= 128
+        # answer tokens survive. A 2026-09 census rescued the same count for any threshold in
+        # 64..512 (trimmable answers are long captions / document conversions), so 128 is not
+        # a sensitive choice.
+        min_answer_tokens_after_trim=128,
     )
     cfg.dataset = EuroVLEnergonProvider(
         root=EUROVL_ENERGON_ROOT,

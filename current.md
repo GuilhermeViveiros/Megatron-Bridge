@@ -216,7 +216,16 @@ asserts `t_index=0` + timestamp-base-advance. **Uncommitted in the working tree*
   vision **unfreezes (SFT)**, switch: have `_decode_video_bytes` return the sampled frames as a `[N,C,H,W]`
   tensor batch and feed `MoonViTVideoProcessor.vectorized_preprocess` (ties into #12) — no PIL, all frames
   processed together. `auto_decode=False` already gives us that control (we decode N frames ourselves).
-- **#31 Trim trailing text instead of skipping overflowing samples** (user request 2026-09-21). Today a
+- **#31 Trim trailing text instead of skipping overflowing samples** (user request 2026-09-21).
+  **DONE 2026-09-22 as an ANSWER trim, not a question trim** (user decision): when the overflow lies
+  inside the FINAL assistant answer and >= `min_answer_tokens_after_trim` (recipe: 128) answer tokens
+  survive, the answer's tail and its `<|im_end|>` are cut instead of skipping the sample. Trimming
+  the question was rejected: it can drop the option the answer refers to (wrong supervision),
+  whereas every kept answer token is still the true next token. The loss mask is now built on the
+  FULL sequence via the `_build_loss_mask` hook (EuroVL's post-hoc re-mask found 0 tokens in a cut
+  answer). Census (`sanity_check/measure_answer_trim.py`): rescues ~7% of 8K overflow
+  (doclingmatix, llava_video_178k, molmo2_cap_clips, ...); 92% overflows on the input side -> #32.
+  Original note, kept for context: Today a
   sample whose length exceeds `seq_length` is dropped whole (`SkipSample`, flat path
   `hf_encoder_task_encoder.py:281-290` gated by `skip_on_truncation`; message-tree path
   `euro_vl_task_encoder.py:461-470`). Change: if the overflow comes from **more than X text tokens after
@@ -246,6 +255,16 @@ asserts `t_index=0` + timestamp-base-advance. **Uncommitted in the working tree*
     `seq_length - text_tokens - margin` instead of a flat 85%. Text-heavy samples then get fewer frames
     / lower resolution and keep their question intact -- no semantic risk, and it also absorbs the
     unaccounted ~8.5 tok/frame overhead.
+
+- **#32 Per-sample vision budget for multi-image samples** (2026-09-22, from the #31 census). 92% of
+  8K overflow is on the INPUT side, dominated by multi-image documents: leopard_mpdocvqa 49%,
+  molmo2_table 47%, molmo2_doc_translated 40%, leopard_dude 39%, molmo2_doc 32%,
+  molmo2_chart_translated 26%, mp_docvqa 25% (plus ego4d_nlq 38% / activity_net_1 17% for video +
+  long question). Today those samples are skipped whole. Idea: size the per-image pixel budget from
+  `seq_length - text_tokens - margin` (split across pages) so documents shrink page resolution to
+  fit, the image analogue of the per-sample video budget in #31. Trade-off: lower page resolution
+  hurts OCR-heavy docs, so measure the resolution each dataset would drop to before enabling it.
+  At 16K overflow already falls 1,169 -> 197 (almost all still these doc sets).
 
 ---
 

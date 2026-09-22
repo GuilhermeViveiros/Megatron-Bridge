@@ -262,6 +262,119 @@ class TestHFEncoderVLMTaskEncoderEncodeSample(unittest.TestCase):
         encoded = encoder.encode_sample(sample)
         self.assertEqual(tuple(encoded.input_ids.shape), (4,))
 
+    # ------------------------------------------------------------------
+    # min_answer_tokens_after_trim: trim the FINAL answer instead of skipping
+    # ------------------------------------------------------------------
+    # Layout used below (15 tokens): question [1, 2, 3] at 0..2, answer 20..29 at 3..12,
+    # closing template [90, 91] at 13..14. Answer span = (3, 13).
+    QUESTION, ANSWER, TEMPLATE = [1, 2, 3], list(range(20, 30)), [90, 91]
+
+    def _trim_encoder(self, seq_length, min_kept, answer_tokens=None, input_ids=None):
+        ids = input_ids if input_ids is not None else self.QUESTION + self.ANSWER + self.TEMPLATE
+        processor = _make_processor(
+            input_ids=torch.tensor([ids]),
+            encode_return=self.ANSWER if answer_tokens is None else answer_tokens,
+        )
+        processor.video_token_id = None
+        return HFEncoderVLMTaskEncoder(
+            processor=processor,
+            seq_length=seq_length,
+            visual_keys=("pixel_values",),
+            skip_on_truncation=True,
+            min_answer_tokens_after_trim=min_kept,
+        )
+
+    @staticmethod
+    def _qa_sample():
+        return _make_chatml_sample(
+            conversation=json.dumps([{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A"}])
+        )
+
+    def test_trims_when_cut_falls_inside_final_answer(self):
+        encoded = self._trim_encoder(seq_length=12, min_kept=5).encode_sample(self._qa_sample())
+
+        self.assertEqual(encoded.input_ids.tolist(), self.QUESTION + self.ANSWER[:9])
+        # The closing template is gone, so the model is never taught to stop mid-answer ...
+        self.assertNotIn(90, encoded.input_ids.tolist())
+        # ... and the last kept position predicts the TRUE next answer token (the first one cut).
+        self.assertEqual(encoded.labels[-1].item(), self.ANSWER[9])
+        self.assertEqual(encoded.loss_mask[-1].item(), 1.0)
+        # The question is untouched and unsupervised.
+        self.assertTrue((encoded.loss_mask[:2] == 0).all())
+
+    def test_skips_when_too_few_answer_tokens_survive(self):
+        # Cutting at 12 keeps 9 answer tokens, below the required 10.
+        with self.assertRaises(SkipSample):
+            self._trim_encoder(seq_length=12, min_kept=10).encode_sample(self._qa_sample())
+
+    def test_skips_when_cut_reaches_into_the_question(self):
+        # Cutting at 2 would remove question tokens: never trimmed, whatever the threshold.
+        with self.assertRaises(SkipSample):
+            self._trim_encoder(seq_length=2, min_kept=1).encode_sample(self._qa_sample())
+
+    def test_skips_when_final_answer_not_located(self):
+        # The answer's tokens do not occur in input_ids, so there is no span to trim within.
+        with self.assertRaises(SkipSample):
+            self._trim_encoder(seq_length=12, min_kept=1, answer_tokens=[77, 78]).encode_sample(self._qa_sample())
+
+    def test_cut_in_closing_template_keeps_whole_answer(self):
+        # Overflow of one token lands on the template, so the full answer survives.
+        encoded = self._trim_encoder(seq_length=14, min_kept=10).encode_sample(self._qa_sample())
+        self.assertEqual(encoded.input_ids.tolist()[3:13], self.ANSWER)
+
+    def test_multi_turn_uses_the_final_answer(self):
+        # [1] q1, [20, 21] answer 1, [2] q2, [30..39] final answer, [90] template.
+        final = list(range(30, 40))
+        ids = [1, 20, 21, 2] + final + [90]
+        processor = _make_processor(input_ids=torch.tensor([ids]))
+        processor.tokenizer.encode.side_effect = [[20, 21], final]
+        processor.video_token_id = None
+        conversation = json.dumps(
+            [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": "a2"},
+            ]
+        )
+
+        def encoder(min_kept):
+            processor.tokenizer.encode.side_effect = [[20, 21], final]
+            return HFEncoderVLMTaskEncoder(
+                processor=processor,
+                seq_length=12,
+                visual_keys=("pixel_values",),
+                skip_on_truncation=True,
+                min_answer_tokens_after_trim=min_kept,
+            )
+
+        # Cutting at 12 keeps 8 tokens of the FINAL answer (positions 4..11).
+        encoded = encoder(min_kept=8).encode_sample(_make_chatml_sample(conversation=conversation))
+        self.assertEqual(encoded.input_ids.tolist(), [1, 20, 21, 2] + final[:8])
+        with self.assertRaises(SkipSample):
+            encoder(min_kept=9).encode_sample(_make_chatml_sample(conversation=conversation))
+
+    def test_final_answer_span_is_last_supervised_run(self):
+        import numpy as np
+
+        span = HFEncoderVLMTaskEncoder._final_answer_span
+        # Two answers: [2, 4) and [6, 9); the final one is the last run.
+        self.assertEqual(span(np.array([0, 0, 1, 1, 0, 0, 1, 1, 1, 0], dtype=np.float32)), (6, 9))
+        # Answer running to the very end of the sequence.
+        self.assertEqual(span(np.array([0, 1, 1, 1], dtype=np.float32)), (1, 4))
+        # Nothing supervised -> no span, so the trim rule skips.
+        self.assertEqual(span(np.zeros(5, dtype=np.float32)), (-1, -1))
+
+    def test_trim_threshold_requires_skip_on_truncation(self):
+        with self.assertRaises(ValueError):
+            HFEncoderVLMTaskEncoder(processor=_make_processor(), seq_length=8, min_answer_tokens_after_trim=4)
+
+    def test_trim_threshold_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            HFEncoderVLMTaskEncoder(
+                processor=_make_processor(), seq_length=8, skip_on_truncation=True, min_answer_tokens_after_trim=0
+            )
+
     def test_loss_mask_only_on_assistant(self):
         # Tokens: [10, 11, 12, 13, 14]
         # Assistant answer tokens: [13, 14]  (at positions 3,4)

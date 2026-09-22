@@ -36,7 +36,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -54,7 +54,6 @@ from megatron.bridge.data.energon.task_encoder_utils import (
     ChatMLSample,
     _images_to_pil,
     _videos_to_pil,
-    cook_chatml_sample,
 )
 from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
@@ -134,6 +133,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         processor: An ``EuroVLProcessor`` (supports ``apply_chat_template`` and
             ``__call__(text=, images=)`` returning ``pixel_values`` + ``image_grid_thw``).
         seq_length: Maximum sequence length (tokens truncated to this).
+        min_answer_tokens_after_trim: Truncate (instead of skip) an overflowing sample whose cut
+            falls inside its final answer, if at least this many answer tokens survive. ``None``
+            skips every overflowing sample. See ``HFEncoderVLMTaskEncoder``.
     """
 
     def __init__(
@@ -143,6 +145,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         sqrt_loss_weighting: bool = False,
         root_subsegments: bool = False,
         max_num_images: int = 16,
+        min_answer_tokens_after_trim: int | None = None,
     ) -> None:
         # EuroVLProcessor returns pixel_values + image_grid_thw for images and
         # pixel_values_videos + video_grid_thw for videos; capture all four so
@@ -152,6 +155,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             seq_length=seq_length,
             visual_keys=("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"),
             skip_on_truncation=True,
+            min_answer_tokens_after_trim=min_answer_tokens_after_trim,
         )
         # Cheap pre-filter for multi-image samples: dropped before any image is decoded.
         # Doesn't guarantee a sample fits seq_length on its own (per-image token cost varies a
@@ -328,12 +332,8 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         """Encode like the generic HF encoder, but build the loss mask with the
         repo-standard search helper.
 
-        The base ``HFEncoderVLMTaskEncoder`` masks via a naive exact-token search of the
-        standalone assistant text, which fails for EuroLLM's SentencePiece tokenizer (a
-        response following a newline tokenizes without its leading ``▁``). We reuse
-        ``create_multiturn_loss_mask_by_search`` — the same helper every VLM collate uses
-        (qwen2_5, glm4v, ministral3, the EuroVL mock path) — which searches the *final*
-        ``input_ids`` (robust to ``<image>`` expansion) with newline-context candidates.
+        The loss mask itself comes from :meth:`_build_loss_mask`, which the base encoder calls
+        on the full sequence before truncation; this method only adds the square-root weighting.
 
         Samples whose JSON is a message tree (``{"message_tree": true, ...}``) are routed to
         :meth:`_encode_message_tree`; everything else takes the flat path below.
@@ -344,32 +344,33 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
 
         encoded = super().encode_sample(sample)
 
-        conversation = cook_chatml_sample(sample.conversation)
-        skipped = extract_skipped_token_ids(self.processor)
-        mask = create_multiturn_loss_mask_by_search(
-            {"conversation": conversation}, encoded.input_ids, self.processor, skipped
-        )
-        loss_mask = torch.tensor(mask, dtype=torch.float32)
-
-        # Shift to align the loss with next-token labels (same convention as the base encoder).
-        shifted = torch.zeros_like(loss_mask)
-        shifted[:-1] = loss_mask[1:]
-        labels = encoded.input_ids.clone().to(torch.long)
-        labels[:-1] = encoded.input_ids[1:].to(torch.long)
-        labels[-1] = IGNORE_INDEX
-        labels[shifted == 0] = IGNORE_INDEX
-
         # Square-root per-token loss reweighting (InternVL3.5 eq. 2): scale this sample's
         # supervised tokens by 1/sqrt(N), N = number of supervised (response) tokens. Count
         # N on the still-binary mask, then divide. Pairs with calculate_per_token_loss=True.
+        # N counts the tokens that survived truncation, so a trimmed answer is weighted by
+        # what it actually trains on.
         if self.sqrt_loss_weighting:
-            num_supervised = int((shifted > 0).sum())
+            num_supervised = int((encoded.loss_mask > 0).sum())
             if num_supervised > 0:
-                shifted = shifted / (num_supervised**0.5)
-
-        encoded.loss_mask = shifted
-        encoded.labels = labels
+                encoded.loss_mask = encoded.loss_mask / (num_supervised**0.5)
         return encoded
+
+    def _build_loss_mask(self, input_ids_np: np.ndarray, conversation: List[Dict]) -> np.ndarray:
+        """Locate assistant answers with the SentencePiece-robust search.
+
+        The base encoder's exact search of each answer's standalone tokenization fails for
+        EuroLLM's SentencePiece tokenizer: a response following a newline tokenizes without its
+        leading ``▁``. ``create_multiturn_loss_mask_by_search`` -- the helper every VLM collate
+        uses (qwen2_5, glm4v, ministral3, the EuroVL mock path) -- also tries newline-context
+        candidates. It must run on the FULL sequence: once the answer-trim rule has cut an answer
+        its complete token sequence is gone and the search would find nothing (0 supervised
+        tokens), which is why this is a pre-truncation hook rather than a post-hoc re-mask.
+        """
+        skipped = extract_skipped_token_ids(self.processor)
+        mask = create_multiturn_loss_mask_by_search(
+            {"conversation": conversation}, torch.as_tensor(input_ids_np), self.processor, skipped
+        )
+        return np.asarray(mask, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Message-tree samples (docs/models/euro_vl/message-tree-packing.md)
