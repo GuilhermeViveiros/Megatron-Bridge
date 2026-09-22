@@ -69,11 +69,13 @@ class EuroVLBridge(MegatronModelBridge):
         The backbone is dispatched on ``text_config.model_type`` (both backbones share
         the ``euro_vl`` HF model_type, so one bridge serves both):
 
-          - ``"llama"`` (EuroLLM, default): :class:`EuroVLModelProvider`, 1D RoPE + fusion.
-          - ``"qwen3"`` (Qwen3EuroVL oracle): :class:`Qwen3EuroVLModelProvider` — its
-            subclass defaults carry the interleaved-M-RoPE config (``mrope`` position
-            embedding, ``mrope_section``, ``apply_rope_fusion=False``); plus Qwen3's
+          - ``"llama"`` (EuroLLM, default): :class:`EuroVLModelProvider`.
+          - ``"qwen3"`` (Qwen3EuroVL oracle): :class:`Qwen3EuroVLModelProvider`, plus Qwen3's
             QK-norm (``qk_layernorm=True``).
+
+        Both providers' defaults carry the interleaved-M-RoPE config (``mrope`` position
+        embedding, ``mrope_section``, ``apply_rope_fusion=False``) and are never overridden
+        here, so an imported checkpoint's run_config builds (and exports) the M-RoPE model.
         """
         hf_config = hf_pretrained.config
         text_config = hf_config.text_config
@@ -100,14 +102,9 @@ class EuroVLBridge(MegatronModelBridge):
         provider.add_qkv_bias = False
 
         if is_qwen3:
-            # QK-norm per attention head (q_norm/k_norm weights). RoPE settings are NOT
-            # touched here — the Qwen3EuroVLModelProvider defaults (mrope, no fusion,
-            # mrope_section) must survive.
+            # QK-norm per attention head (q_norm/k_norm weights).
             provider.qk_layernorm = True
         else:
-            # EuroLLM: standard 1D RoPE with the fused kernel.
-            provider.apply_rope_fusion = True
-            provider.position_embedding_type = "rope"
             # EuroLLM's 128005 vocab is odd and cannot be split across TP ranks. Pad it to one
             # TP-independent size so an imported checkpoint loads at TP=1/2/4 (see utils.py); the
             # weight hooks below keep the HF side at its true 128005 rows.

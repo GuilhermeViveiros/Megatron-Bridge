@@ -134,3 +134,46 @@ class TestBridgeVocabHooks:
             task=None, converted_weights_dict={EMBED: padded}, hf_state_dict={}
         )[EMBED]
         torch.testing.assert_close(restored, original)
+
+
+class TestProviderBridge:
+    """The provider built on HF import is what gets saved to run_config.yaml and rebuilt on export."""
+
+    @staticmethod
+    def _pretrained():
+        from transformers import LlamaConfig
+
+        text_config = LlamaConfig(
+            vocab_size=EUROLLM_VOCAB,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+        )
+        hf_config = SimpleNamespace(
+            text_config=text_config,
+            tie_word_embeddings=False,
+            vision_config=None,
+            projector_input_dim=32,
+            projector_output_dim=64,
+            image_token_id=1,
+            vision_start_token_id=2,
+            vision_end_token_id=3,
+            vision_pad_token_id=4,
+            video_token_id=5,
+        )
+        return SimpleNamespace(config=hf_config)
+
+    def test_eurollm_import_keeps_mrope(self):
+        """EuroLLM trains with M-RoPE; a 1D-rope provider here fails the mrope_section assert on export."""
+        provider = EuroVLBridge().provider_bridge(self._pretrained())
+        assert provider.position_embedding_type == "mrope"
+        assert provider.apply_rope_fusion is False
+        assert provider.mrope_section is not None
+
+    def test_eurollm_import_pins_padded_vocab(self):
+        provider = EuroVLBridge().provider_bridge(self._pretrained())
+        assert provider.should_pad_vocab is True
+        assert provider.padded_vocab_size == EUROLLM_PADDED_VOCAB_SIZE
