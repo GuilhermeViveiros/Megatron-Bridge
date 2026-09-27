@@ -33,14 +33,14 @@ images and video frames are resized identically.
 """
 
 import math
-import numpy as np
-from PIL import Image
 from typing import Optional, Union
 
+import numpy as np
 import torch
+from PIL import Image
 from torchvision.transforms import functional as TF
-from transformers.image_utils import ImageInput, make_list_of_images, valid_images
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+from transformers.image_utils import ImageInput, make_list_of_images, valid_images
 from transformers.utils import TensorType
 
 
@@ -49,6 +49,8 @@ OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 class MoonViTImageProcessor(BaseImageProcessor):
+    """Resizes images/video frames to MoonViT's patch grid and returns per-image grid dims."""
+
     model_type = "moonvit"
 
     def __init__(
@@ -161,5 +163,3 @@ class MoonViTImageProcessor(BaseImageProcessor):
         data = {"pixel_values": pixel_values, "image_grid_hws": image_grid_hws}
 
         return BatchFeature(data=data, tensor_type=return_tensors)
-
-

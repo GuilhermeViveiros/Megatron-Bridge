@@ -141,11 +141,19 @@ class EuroVLProcessor(ProcessorMixin):
             video_processor.total_pixels = int(budget_fraction * seq_length * video_processor._merge_factor**2)
             logger.info(
                 "Video token budget: total_pixels=%d (budget_fraction=%.2f * seq_length=%d * merge_factor^2=%d)",
-                video_processor.total_pixels, budget_fraction, seq_length, video_processor._merge_factor**2,
+                video_processor.total_pixels,
+                budget_fraction,
+                seq_length,
+                video_processor._merge_factor**2,
             )
         logger.info(
             "Video smart-resize policy: fps=%.2f frames=[%d,%d] pixels=[%d,%d] total_pixels=%d",
-            fps, min_frames, max_frames, min_pixels, max_pixels, video_processor.total_pixels,
+            fps,
+            min_frames,
+            max_frames,
+            min_pixels,
+            max_pixels,
+            video_processor.total_pixels,
         )
         tokenizer = AutoTokenizer.from_pretrained(path)
         if chat_template is None:

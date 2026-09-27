@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone HF reference model for EuroVL (MoonViT + EuroLLM).
+"""Standalone HF reference model for EuroVL (MoonViT + any supported LLM backbone).
 
 This is the pure-transformers definition that ``AutoBridge`` converts to Megatron.
-It bundles the vendored MoonViT vision tower, a 2-layer MLP projector, and a causal
-LM built from ``text_config``: ``LlamaForCausalLM`` for EuroLLM (via
-``AutoModelForCausalLM``, stock 1D RoPE), or ``_Qwen3VLTextForCausalLM`` for the
-Qwen3EuroVL oracle backbone (below) -- a thin wrapper around transformers' own
-``Qwen3VLTextModel``, which is M-RoPE-aware. Injects projected image features into
-the text embedding stream at ``image_token_id`` positions via ``masked_scatter``.
+It bundles the vendored MoonViT vision tower, a 2-layer MLP projector, and
+:class:`EuroVLTextForCausalLM` -- one interleaved-M-RoPE causal LM used for every
+backbone (EuroLLM, Qwen3, ...), mirroring Megatron's backbone-generic
+``_build_mrope_gpt_model``. Injects projected image features into the text embedding
+stream at ``image_token_id`` positions via ``masked_scatter``.
 """
 
 from typing import Optional
@@ -31,48 +30,74 @@ from transformers.generation import GenerationMixin
 from transformers.loss.loss_utils import ForCausalLMLoss
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
 
 from megatron.bridge.models.euro_vl.configuration_euro_vl import EuroVLConfig
 from megatron.bridge.models.euro_vl.moonvit.modeling_moonvit import MoonVitPretrainedModel
 
 
-class _Qwen3VLTextForCausalLM(nn.Module):
-    """M-RoPE-aware causal LM: transformers' ``Qwen3VLTextModel`` backbone + a separate
-    ``lm_head``, exposing the same ``model.*`` / ``lm_head.*`` attribute structure as
-    ``Qwen3ForCausalLM`` (``self.model.embed_tokens``, ``self.model.layers``,
-    ``self.model.norm``, ``self.lm_head``).
+# Supported LLM backbones, keyed by ``text_config.model_type`` -> whether the backbone has
+# per-head QK-RMSNorm weights. Mirrors ``patch_qk_norm`` in ``euro_vl_provider`` and the
+# bridge's QK-norm mapping dispatch. Adding a backbone = one entry here.
+_BACKBONE_HAS_QK_NORM = {
+    "qwen3": True,
+    "llama": False,
+}
 
-    Stock ``Qwen3ForCausalLM`` -> ``Qwen3Model`` cannot consume 3D M-RoPE ``position_ids``:
-    its ``forward`` threads the same ``position_ids`` into both the rotary embedding AND
-    ``create_causal_mask(...)``, which expects a plain 2D ``(batch, seq_len)`` tensor. Real
-    Qwen3-VL solves this with ``Qwen3VLTextModel``, which splits ``position_ids`` into a 1D
-    slice for the causal mask and the full 3-channel tensor for the rotary embedding -- so
-    this wraps that class outright rather than reimplementing the split. All actual
-    computation (embeddings, attention, rotary, decoder layers) is ``Qwen3VLTextModel``
-    unchanged; the only addition is the LM head + its application in ``forward``, mirroring
-    ``Qwen3VLForConditionalGeneration.forward()`` one level shallower so the attribute path
-    matches ``EuroVLBridge``'s existing ``language_model.model.*`` HF key mapping unchanged --
-    no bridge changes needed.
+# Default ``Qwen3VLTextRotaryEmbedding`` falls back to when ``rope_parameters`` has no
+# ``mrope_section`` (true for every exported EuroVL config today).
+_DEFAULT_MROPE_SECTION = [24, 20, 20]
 
-    ``tie_word_embeddings=True`` for this checkpoint, so the exported safetensors has no
-    separate ``lm_head.weight`` entry at all -- only ``embed_tokens.weight`` is saved. A
-    tied ``nn.Linear`` set up by sharing the Parameter object at ``__init__`` time does NOT
-    survive ``from_pretrained``: modern ``transformers`` loading replaces the
-    ``embed_tokens.weight`` Parameter object rather than copying into it in-place, which
-    breaks any reference-sharing tie made beforehand (this wrapper is a plain ``nn.Module``,
-    not a ``PreTrainedModel``, so it never goes through ``post_init()`` -> ``tie_weights()``
-    afterward the way ``Qwen3ForCausalLM`` does to re-tie post-load). So when tied, no
-    separate ``lm_head`` parameter is stored at all -- logits are computed via
-    ``F.linear`` against the live ``embed_tokens.weight`` every forward call, which is
-    exactly the on-disk structure of this checkpoint.
+
+class EuroVLTextForCausalLM(nn.Module):
+    """Interleaved-M-RoPE causal LM shared by every EuroVL LLM backbone.
+
+    The trunk is transformers' ``Qwen3VLTextModel`` for all backbones -- the only upstream
+    text model that consumes 3D ``(t, h, w)`` position ids (it splits them into a 1D slice for
+    the causal mask and the 3-channel tensor for the rotary embedding). Apart from QK-norm,
+    its attention, MLP, norms and parameter names are identical to ``LlamaModel``, so for
+    backbones without QK-norm the ``q_norm``/``k_norm`` modules are swapped for
+    ``nn.Identity``, leaving exactly the Llama parameter set and computation. This matches the
+    Megatron side, which builds the same ``Qwen3VLGPTModel`` for every backbone.
+
+    Exposes the ``model.*`` / ``lm_head.*`` attribute layout of ``*ForCausalLM`` so the bridge's
+    ``language_model.model.*`` key mapping applies unchanged.
+
+    With ``tie_word_embeddings=True`` no separate ``lm_head`` parameter exists: logits use the
+    live ``embed_tokens.weight``. A Parameter-sharing tie made in ``__init__`` would not survive
+    ``from_pretrained`` (loading replaces the ``embed_tokens.weight`` Parameter, and this plain
+    ``nn.Module`` never goes through ``tie_weights()``), and the on-disk tied checkpoint has no
+    ``lm_head.weight`` entry anyway.
     """
 
     def __init__(self, config) -> None:
         super().__init__()
+        model_type = getattr(config, "model_type", None)
+        if model_type not in _BACKBONE_HAS_QK_NORM:
+            raise ValueError(
+                f"Unsupported EuroVL text backbone model_type={model_type!r}; "
+                f"supported: {sorted(_BACKBONE_HAS_QK_NORM)}"
+            )
+        if getattr(config, "mlp_bias", False):
+            raise ValueError("EuroVLTextForCausalLM requires mlp_bias=False (Qwen3VLTextMLP has no MLP bias)")
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        mrope_section = (getattr(config, "rope_parameters", None) or {}).get("mrope_section", _DEFAULT_MROPE_SECTION)
+        if sum(mrope_section) != head_dim // 2:
+            raise ValueError(
+                f"mrope_section={mrope_section} must sum to head_dim // 2 = {head_dim // 2}; "
+                "set rope_parameters['mrope_section'] in text_config to match the Megatron provider"
+            )
+
         self.config = config
         self.model = Qwen3VLTextModel._from_config(config)
+        if not _BACKBONE_HAS_QK_NORM[model_type]:
+            for layer in self.model.layers:
+                attn = layer.self_attn
+                assert hasattr(attn, "q_norm") and hasattr(attn, "k_norm"), (
+                    "Qwen3VLTextAttention no longer exposes q_norm/k_norm; revisit the QK-norm removal"
+                )
+                attn.q_norm = nn.Identity()
+                attn.k_norm = nn.Identity()
         self.lm_head = (
             None if config.tie_word_embeddings else nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         )
@@ -143,11 +168,11 @@ class EuroVLMultiModalProjector(nn.Module):
 
 
 class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
-    """EuroVL: MoonViT vision tower + MLP projector + EuroLLM (Llama) decoder."""
+    """EuroVL: MoonViT vision tower + MLP projector + M-RoPE LLM decoder."""
 
     config_class = EuroVLConfig
     base_model_prefix = "model"
-    _no_split_modules = ["MoonVitEncoderLayer", "LlamaDecoderLayer", "Qwen3DecoderLayer"]
+    _no_split_modules = ["MoonVitEncoderLayer", "Qwen3VLTextDecoderLayer"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
@@ -155,16 +180,9 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.vision_tower = MoonVitPretrainedModel(config.vision_config)
         self.multi_modal_projector = EuroVLMultiModalProjector(config)
-        # Build whichever causal LM `text_config` describes: LlamaConfig -> LlamaForCausalLM
-        # (EuroLLM, stock 1D RoPE) or Qwen3Config -> _Qwen3VLTextForCausalLM (the Qwen3EuroVL
-        # oracle backbone; M-RoPE-aware, see the class docstring above for why stock
-        # Qwen3ForCausalLM can't be used here).
-        if config.text_config.model_type == "qwen3":
-            self.language_model = _Qwen3VLTextForCausalLM(config.text_config)
-        else:
-            self.language_model = AutoModelForCausalLM.from_config(config.text_config)
-        # Cached per-batch M-RoPE delta from the last full position-id computation (Qwen3
-        # backbone only); see `_compute_position_ids`. Mirrors `Qwen2VLModel.rope_deltas`.
+        self.language_model = EuroVLTextForCausalLM(config.text_config)
+        # Cached per-batch M-RoPE delta from the last full position-id computation; see
+        # `_compute_position_ids`. Mirrors `Qwen2VLModel.rope_deltas`.
         self._rope_deltas = None
         self.post_init()
 
@@ -278,8 +296,8 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         past_key_values,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.LongTensor]:
-        """3D M-RoPE position ids for the Qwen3EuroVL backbone, reusing the exact same
-        ``get_rope_index`` that Megatron's ``Qwen3EuroVLModel.forward`` calls (see
+        """3D M-RoPE position ids, reusing the exact same ``get_rope_index`` that Megatron's
+        ``Qwen3EuroVLModel.forward`` calls for every backbone (see
         ``megatron.bridge.models.euro_vl.rope``).
 
         M-RoPE is one unified formulation that already produces correct positions for plain
@@ -300,13 +318,7 @@ class EuroVLForConditionalGeneration(PreTrainedModel, GenerationMixin):
         ``get_rope_index``'s padded-batch path) -- the per-row delta below still works
         unmodified for padded rows, since ``past_length`` (from the shared KV cache) grows by
         the same padded width for every row regardless of its own content length.
-
-        Returns ``None`` for the plain EuroLLM (Llama) backbone, which doesn't use M-RoPE --
-        the underlying causal LM falls back to its own default 1D positions.
         """
-        if self.config.text_config.model_type != "qwen3":
-            return None
-
         past_length = 0 if past_key_values is None else past_key_values.get_seq_length()
 
         if past_length == 0:
