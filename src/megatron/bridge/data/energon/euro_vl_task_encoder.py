@@ -55,7 +55,6 @@ from megatron.bridge.data.energon.task_encoder_utils import (
     _images_to_pil,
     _videos_to_pil,
 )
-from megatron.bridge.data.vlm_datasets.collate import create_multiturn_loss_mask_by_search
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 from megatron.bridge.models.euro_vl.utils import ATTEND_ALL_SUBSEGMENT_ID
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
@@ -79,7 +78,130 @@ _MULTI_VIDEO_RE = re.compile(r"^vid(\d+)\.(?:mp4|webm|mkv|mov|avi)$")
 
 # Message-tree subsegment ids: re-exported from the model side so the encoder and the attention
 # mask cannot drift apart. See megatron.bridge.models.euro_vl.utils for the convention.
-__all__ = ["ATTEND_ALL_SUBSEGMENT_ID", "EuroVLTaskEncoder", "EuroVLTaskSample"]
+__all__ = [
+    "ATTEND_ALL_SUBSEGMENT_ID",
+    "EuroVLTaskEncoder",
+    "EuroVLTaskSample",
+    "assistant_answer_mask",
+    "assistant_answer_spans",
+]
+
+# Role name the chat template writes into an assistant turn's header.
+_ASSISTANT_ROLE = "assistant"
+
+
+def assistant_answer_spans(ids: List[int], tokenizer) -> List[tuple[int, int]]:
+    """``[start, end)`` token spans of every assistant answer, read off the template markers.
+
+    The EuroVL chat template renders each turn as ``<|im_start|>{role}\\n{content}<|im_end|>\\n``
+    (see the model's ``chat_template.jinja``), so an answer is exactly the tokens between an
+    assistant header and the next ``<|im_end|>``. Reading those markers is exact, whereas
+    searching for the answer's text matches the first place that text occurs -- which is the
+    question whenever an answer is repeated earlier in the sequence (short answers, and
+    table-QA turns whose questions quote the previous answer).
+
+    The header is matched as a token sequence (``<|im_start|>assistant\\n`` tokenized once), so
+    this needs nothing from the tokenizer beyond ``__call__`` and ``convert_tokens_to_ids``.
+    Unlike searching for answer *text*, the header is template-generated and identical in every
+    sample, so it tokenizes the same standalone as in context -- ``validate_answer_markers.py``
+    checks that round-trip on every prepared dataset.
+
+    Args:
+        ids: Token ids of the whole rendered conversation.
+        tokenizer: Tokenizer that produced ``ids``.
+
+    Returns:
+        Spans in increasing order; empty when the sequence holds no assistant turn.
+
+    Raises:
+        ValueError: If the tokenizer lacks the ``<|im_start|>`` / ``<|im_end|>`` markers.
+    """
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if im_start is None or im_end is None or im_start == unk or im_end == unk:
+        raise ValueError(
+            "Tokenizer has no <|im_start|>/<|im_end|> markers; assistant answers cannot be "
+            "located structurally. Override _build_loss_mask for this template."
+        )
+    header = tokenizer(f"<|im_start|>{_ASSISTANT_ROLE}\n", add_special_tokens=False)["input_ids"]
+    if not header or header[0] != im_start:
+        raise ValueError(
+            f"Assistant header {header} does not start with <|im_start|> ({im_start}); the chat "
+            "template does not match the one this mask assumes."
+        )
+
+    spans: List[tuple[int, int]] = []
+    n, h = len(ids), len(header)
+    i = 0
+    while i <= n - h:
+        if ids[i : i + h] != list(header):
+            i += 1
+            continue
+        start = i + h
+        end = start
+        while end < n and ids[end] != im_end:
+            end += 1
+        if end > start:
+            spans.append((start, end))
+        i = max(end, start)  # Content cannot hold another header.
+    return spans
+
+
+def assistant_answer_mask(
+    input_ids,
+    tokenizer,
+    skipped_token_ids=None,
+    supervise_turn_end: bool = True,
+    require_answer: bool = True,
+) -> np.ndarray:
+    """Float32 0/1 mask over ``input_ids``, 1.0 on assistant-answer tokens.
+
+    With ``supervise_turn_end`` (the default) each answer's closing ``<|im_end|>`` is supervised
+    too. That token is EuroVL's EOS (``eos_token_id=4``, ``eos_token="<|im_end|>"``), so the
+    label shift makes the answer's last text position predict EOS and the model learns where to
+    stop. It needs an explicit opt-out of the shared pad-token filter, which lists
+    ``<|im_end|>`` among ``QWEN_TOKENS`` and would otherwise zero it: see
+    ``vlm_datasets.token_utils.PAD_TOKENS``. Masking it (the behaviour before 2026-10) trains
+    the model never to emit its own stop token.
+
+    Args:
+        input_ids: Token ids of the whole rendered conversation (tensor or array-like).
+        tokenizer: Tokenizer that produced the ids.
+        skipped_token_ids: Ids to force to 0 (pad / image / video placeholders).
+        supervise_turn_end: Supervise each answer's closing ``<|im_end|>`` (EOS).
+        require_answer: Raise when the sequence holds no answer at all. The message-tree
+            path passes False so its per-branch check can name the offending branch.
+
+    Returns:
+        A float32 array of the same length as ``input_ids``.
+
+    Raises:
+        ValueError: If the sequence contains no assistant answer, i.e. nothing to supervise.
+    """
+    ids = input_ids.tolist() if torch.is_tensor(input_ids) else np.asarray(input_ids).tolist()
+    spans = assistant_answer_spans(ids, tokenizer)
+    if not spans and require_answer:
+        raise ValueError(
+            "No assistant answer span found: the rendered conversation has no "
+            "'<|im_start|>assistant\\n ... <|im_end|>' turn with content. Training on this "
+            "sample would supervise nothing."
+        )
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    mask = np.zeros(len(ids), dtype=np.float32)
+    for start, end in spans:
+        mask[start:end] = 1.0
+        if supervise_turn_end and end < len(ids) and ids[end] == im_end:
+            mask[end] = 1.0
+
+    skip = {int(t) for t in skipped_token_ids} if skipped_token_ids is not None else set()
+    if supervise_turn_end:
+        skip.discard(int(im_end))
+    if skip:
+        for k, t in enumerate(ids):
+            if t in skip:
+                mask[k] = 0.0
+    return mask
 
 
 @dataclass
@@ -146,6 +268,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         root_subsegments: bool = False,
         max_num_images: int = 16,
         min_answer_tokens_after_trim: int | None = None,
+        supervise_turn_end: bool = True,
     ) -> None:
         # EuroVLProcessor returns pixel_values + image_grid_thw for images and
         # pixel_values_videos + video_grid_thw for videos; capture all four so
@@ -166,6 +289,11 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         # datasets (e.g. doc/leopard_mpdocvqa avg_n=11.3, max_n=40; doc/doc750k avg_n=13.9,
         # max_n=63), while every other dataset's images stay well under it.
         self.max_num_images = max_num_images
+        # Supervise each answer's closing <|im_end|> -- EuroVL's EOS. Without it the model is
+        # never trained to emit its own stop token (the shared pad-token filter masks <|im_end|>,
+        # which is what every run before 2026-10 did), so generation relies on whatever stopping
+        # behaviour the backbone arrived with and can drift once the LLM is unfrozen in SFT.
+        self.supervise_turn_end = supervise_turn_end
         # Square-root per-token loss reweighting (InternVL3.5 eq. 2). When True, each
         # supervised token's loss_mask weight is 1/sqrt(N) (N = supervised tokens in the
         # sample) instead of 1, so a sample's gradient scales with sqrt(N) rather than N.
@@ -356,21 +484,25 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         return encoded
 
     def _build_loss_mask(self, input_ids_np: np.ndarray, conversation: List[Dict]) -> np.ndarray:
-        """Locate assistant answers with the SentencePiece-robust search.
+        """Locate assistant answers from the chat-template markers.
 
-        The base encoder's exact search of each answer's standalone tokenization fails for
-        EuroLLM's SentencePiece tokenizer: a response following a newline tokenizes without its
-        leading ``▁``. ``create_multiturn_loss_mask_by_search`` -- the helper every VLM collate
-        uses (qwen2_5, glm4v, ministral3, the EuroVL mock path) -- also tries newline-context
-        candidates. It must run on the FULL sequence: once the answer-trim rule has cut an answer
-        its complete token sequence is gone and the search would find nothing (0 supervised
-        tokens), which is why this is a pre-truncation hook rather than a post-hoc re-mask.
+        Replaces both text searches (the base encoder's exact search and the VLM collate's
+        SentencePiece-robust ``create_multiturn_loss_mask_by_search``). Both looked for the
+        answer's *text* from index 0 and marked its first occurrence, so an answer repeated
+        earlier in the sequence was supervised in the question instead -- silently, because the
+        only warning fires when nothing at all matches. ``<|im_start|>assistant`` already says
+        where the answer is; see ``assistant_answer_spans``.
+
+        Still a pre-truncation hook: it must run on the FULL sequence so the answer-trim rule
+        measures the real answer, and the structural spans do not depend on the tokenizer's
+        leading-``▁`` behaviour at all.
         """
-        skipped = extract_skipped_token_ids(self.processor)
-        mask = create_multiturn_loss_mask_by_search(
-            {"conversation": conversation}, torch.as_tensor(input_ids_np), self.processor, skipped
+        return assistant_answer_mask(
+            input_ids_np,
+            self._tokenizer,
+            extract_skipped_token_ids(self.processor),
+            supervise_turn_end=self.supervise_turn_end,
         )
-        return np.asarray(mask, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Message-tree samples (docs/models/euro_vl/message-tree-packing.md)
@@ -440,11 +572,18 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             turn_idx += len(branch)
         branch_ends = branch_starts[1:] + [seq_len]
 
-        # Loss on assistant spans only, same search as the flat path; then shift to label positions.
-        skipped = extract_skipped_token_ids(self.processor)
-        mask = torch.tensor(
-            create_multiturn_loss_mask_by_search({"conversation": turns}, input_ids, self.processor, skipped),
-            dtype=torch.float32,
+        # Loss on assistant spans only, read off the template markers like the flat path; then
+        # shift to label positions. A text search here could match a branch's answer inside the
+        # shared prefix (or an earlier branch), leaving that branch unsupervised -- which the
+        # per-branch check below then reported as a data error.
+        mask = torch.from_numpy(
+            assistant_answer_mask(
+                input_ids,
+                self._tokenizer,
+                extract_skipped_token_ids(self.processor),
+                supervise_turn_end=self.supervise_turn_end,
+                require_answer=False,  # the per-branch check below gives a better message
+            )
         )
         for b, (start, end) in enumerate(zip(branch_starts, branch_ends)):
             if mask[start:end].sum() == 0:

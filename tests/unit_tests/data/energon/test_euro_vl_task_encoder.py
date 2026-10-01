@@ -24,11 +24,33 @@ from megatron.bridge.data.energon.euro_vl_task_encoder import EuroVLTaskEncoder
 from megatron.bridge.data.energon.task_encoder_utils import ChatMLSample
 
 
+# Marker ids the mock renders, matching the real chat template's
+# "<|im_start|>{role}\n{content}<|im_end|>". The loss mask is derived from these (see
+# euro_vl_task_encoder.assistant_answer_spans), so a mock's input_ids must look like a real
+# rendering: an assistant header followed by the answer.
+_MOCK_IM_START, _MOCK_ASSISTANT, _MOCK_NEWLINE, _MOCK_IM_END = 3, 10, 271, 4
+_ASSISTANT_HEADER = [_MOCK_IM_START, _MOCK_ASSISTANT, _MOCK_NEWLINE]
+
+
+def _with_answer(prefix_ids, answer_ids=(12,), close=True):
+    """``prefix_ids`` then a rendered assistant turn, as the real template would emit it."""
+    tail = [*_ASSISTANT_HEADER, *answer_ids] + ([_MOCK_IM_END] if close else [])
+    return torch.tensor([list(prefix_ids) + tail])
+
+
 def _make_processor(input_ids=None, encode_return=None, apply_chat_template_return="Hi there"):
     """Build a mock EuroVLProcessor sufficient to drive encode_sample."""
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
-    tokenizer.eos_token_id = 1
+    tokenizer.eos_token_id = _MOCK_IM_END
+    tokenizer.unk_token_id = 0
+    # Only these three are reached by the marker-based loss mask.
+    tokenizer.convert_tokens_to_ids.side_effect = lambda t: {
+        "<|im_start|>": _MOCK_IM_START,
+        "<|im_end|>": _MOCK_IM_END,
+    }.get(t, 0)
+    tokenizer.side_effect = lambda text, add_special_tokens=False: {"input_ids": list(_ASSISTANT_HEADER)}
+    tokenizer.added_tokens_decoder = {}
 
     processor = MagicMock()
     processor.tokenizer = tokenizer
@@ -37,7 +59,7 @@ def _make_processor(input_ids=None, encode_return=None, apply_chat_template_retu
     processor.video_token_id = 98
 
     if input_ids is None:
-        input_ids = torch.tensor([[10, 11, 12, 13]])
+        input_ids = _with_answer([], close=False)
     if encode_return is None:
         encode_return = [12, 13]
     tokenizer.encode.return_value = encode_return
@@ -177,7 +199,7 @@ class TestEuroVLTaskEncoderSkipOnTruncation(unittest.TestCase):
     def test_vision_heavy_overflow_raises_skip_sample(self):
         image_token_id = 99
         # seq_length=10; 15 image-placeholder tokens alone already exceed it.
-        input_ids = torch.tensor([[1, 2] + [image_token_id] * 15 + [3, 4]])
+        input_ids = _with_answer([1, 2] + [image_token_id] * 15)
         processor = _make_processor(input_ids=input_ids)
         encoder = EuroVLTaskEncoder(processor=processor, seq_length=10)
 
@@ -193,7 +215,7 @@ class TestEuroVLTaskEncoderSkipOnTruncation(unittest.TestCase):
         image_token_id = 99
         # seq_length=10; only 3 image-placeholder tokens, but the full sequence (13 tokens)
         # still exceeds seq_length -- would previously truncate, now skips instead.
-        input_ids = torch.tensor([[1, 2] + [image_token_id] * 3 + list(range(20, 30))])
+        input_ids = _with_answer([1, 2] + [image_token_id] * 3 + list(range(20, 30)))
         processor = _make_processor(input_ids=input_ids)
         encoder = EuroVLTaskEncoder(processor=processor, seq_length=10)
 
@@ -204,15 +226,16 @@ class TestEuroVLTaskEncoderSkipOnTruncation(unittest.TestCase):
 
     def test_sample_that_already_fits_is_not_skipped(self):
         image_token_id = 99
-        # seq_length=10; total length (6) fits without truncation -- must not be skipped.
-        input_ids = torch.tensor([[1, 2] + [image_token_id] * 3 + [4]])
+        # seq_length=10; total length (3 image tokens + a 4-token assistant turn = 7) fits
+        # without truncation -- must not be skipped.
+        input_ids = _with_answer([image_token_id] * 3, close=False)
         processor = _make_processor(input_ids=input_ids)
         encoder = EuroVLTaskEncoder(processor=processor, seq_length=10)
 
         conversation = json.dumps([{"role": "user", "content": "<image>"}, {"role": "assistant", "content": "ok"}])
         sample = self._make_chatml_sample(conversation, imgs=[torch.rand(3, 4, 4)])
         encoded = encoder.encode_sample(sample)
-        self.assertEqual(tuple(encoded.input_ids.shape), (6,))
+        self.assertEqual(tuple(encoded.input_ids.shape), (7,))
 
 
 if __name__ == "__main__":
@@ -368,7 +391,12 @@ class TestEuroVLMessageTree(unittest.TestCase):
         encoder, processor = self._encoder()
         encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
         positions = (encoded.loss_mask > 0).nonzero(as_tuple=True)[0].tolist()
-        self.assertEqual(self._supervised_text(processor, encoded, positions), "red car three a big road here")
+        # Each answer ends with a supervised <|im_end|>: that token is EuroVL's EOS, so the
+        # model has to learn to emit it (see assistant_answer_mask's supervise_turn_end).
+        self.assertEqual(
+            self._supervised_text(processor, encoded, positions),
+            "red car <|im_end|> three <|im_end|> a big road here <|im_end|>",
+        )
         self.assertTrue(bool((encoded.labels[encoded.loss_mask == 0] == -100).all()))
         # Default: no /sqrt(B) -- a tree weighs exactly what the same branches would weigh flat.
         self.assertTrue(bool((encoded.loss_mask[encoded.loss_mask > 0] == 1.0).all()))
@@ -377,7 +405,7 @@ class TestEuroVLMessageTree(unittest.TestCase):
         """Each branch gets 1/sqrt(N_b), exactly as it would as a standalone flat sample."""
         encoder, _ = self._encoder(sqrt=True)
         encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
-        for b, n_tokens in enumerate((2, 1, 4)):
+        for b, n_tokens in enumerate((3, 2, 5)):  # answer tokens plus the supervised <|im_end|>
             weights = encoded.loss_mask[(encoded.subsegment_ids == b) & (encoded.loss_mask > 0)]
             self.assertEqual(len(weights), n_tokens)
             torch.testing.assert_close(weights, torch.full((n_tokens,), 1 / n_tokens**0.5))
@@ -385,7 +413,7 @@ class TestEuroVLMessageTree(unittest.TestCase):
     def test_root_subsegments_divides_by_sqrt_num_branches(self):
         encoder, _ = self._encoder(sqrt=True, root_subsegments=True)
         encoded = encoder.encode_sample(_tree_sample(self.BRANCHES))
-        for b, n_tokens in enumerate((2, 1, 4)):
+        for b, n_tokens in enumerate((3, 2, 5)):  # answer tokens plus the supervised <|im_end|>
             weights = encoded.loss_mask[(encoded.subsegment_ids == b) & (encoded.loss_mask > 0)]
             torch.testing.assert_close(weights, torch.full((n_tokens,), 1 / (n_tokens**0.5 * 3**0.5)))
 
