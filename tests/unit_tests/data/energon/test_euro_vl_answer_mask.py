@@ -23,8 +23,14 @@ message trees. These tests pin the marker-derived behaviour instead.
 import numpy as np
 import pytest
 import torch
+from megatron.energon import SkipSample
 
-from megatron.bridge.data.energon.euro_vl_task_encoder import assistant_answer_mask, assistant_answer_spans
+from megatron.bridge.data.energon.euro_vl_task_encoder import (
+    assistant_answer_mask,
+    assistant_answer_spans,
+    check_media_placeholders,
+    count_media_markers,
+)
 
 
 IM_START, IM_END, NL = 3, 4, 271
@@ -218,3 +224,72 @@ class TestAssistantAnswerMask:
         shifted[:-1] = mask[1:]
         targets = [ids[p + 1] for p in np.flatnonzero(shifted)]
         assert targets == [TOK["2"], IM_END]
+
+
+@pytest.mark.unit
+class TestMediaPlaceholderCheck:
+    """Attached media must correspond 1:1 with the conversation's <image>/<video> markers.
+
+    Without this, a sample with an image but no ``<image>`` marker encoded with zero image
+    tokens and no ``pixel_values``: text-only training on a question about an image.
+    """
+
+    @staticmethod
+    def _conv(user_text, answer="ok"):
+        return [{"role": "user", "content": user_text}, {"role": "assistant", "content": answer}]
+
+    def test_matching_image_marker_passes(self):
+        check_media_placeholders(self._conv("<image>\nWhat is this?"), n_images=1, n_videos=0, key="k")
+
+    def test_matching_video_marker_passes(self):
+        check_media_placeholders(self._conv("<video>\nDescribe it."), n_images=0, n_videos=1, key="k")
+
+    def test_text_only_sample_passes(self):
+        check_media_placeholders(self._conv("What is 2+2?"), n_images=0, n_videos=0, key="k")
+
+    def test_image_without_marker_skips(self):
+        """The reported bug: mminstruct_qa sample with 1 image and no <image> tag."""
+        with pytest.raises(SkipSample):
+            check_media_placeholders(self._conv("What is this?"), n_images=1, n_videos=0, key="k")
+
+    def test_video_without_marker_skips(self):
+        with pytest.raises(SkipSample):
+            check_media_placeholders(self._conv("Describe it."), n_images=0, n_videos=1, key="k")
+
+    def test_fewer_markers_than_images_skips(self):
+        """Two images, one marker -> the second image is dropped silently."""
+        with pytest.raises(SkipSample):
+            check_media_placeholders(self._conv("<image>\nCompare these."), n_images=2, n_videos=0, key="k")
+
+    def test_more_markers_than_images_skips(self):
+        """A marker with no media stays literal '<image>' text in the prompt."""
+        with pytest.raises(SkipSample):
+            check_media_placeholders(self._conv("<image><image>\nCompare."), n_images=1, n_videos=0, key="k")
+
+    def test_markers_counted_across_turns(self):
+        conv = [
+            {"role": "user", "content": "<image>\nFirst?"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "<image>\nSecond?"},
+            {"role": "assistant", "content": "b"},
+        ]
+        check_media_placeholders(conv, n_images=2, n_videos=0, key="k")
+
+    def test_mixed_image_and_video(self):
+        conv = self._conv("<image>\n<video>\nCompare the photo and the clip.")
+        check_media_placeholders(conv, n_images=1, n_videos=1, key="k")
+        with pytest.raises(SkipSample):  # video attached but only the image marker present
+            check_media_placeholders(self._conv("<image>\nWhat?"), n_images=1, n_videos=1, key="k")
+
+    def test_counts_structured_content(self):
+        """After placeholder structuring, markers are content items rather than inline text."""
+        conv = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What is this?"}]},
+            {"role": "assistant", "content": "ok"},
+        ]
+        assert count_media_markers(conv) == {"image": 1, "video": 0}
+        check_media_placeholders(conv, n_images=1, n_videos=0, key="k")
+
+    def test_counts_inline_and_structured_text_parts(self):
+        conv = [{"role": "user", "content": [{"type": "text", "text": "<video> then <video>"}]}]
+        assert count_media_markers(conv) == {"image": 0, "video": 2}

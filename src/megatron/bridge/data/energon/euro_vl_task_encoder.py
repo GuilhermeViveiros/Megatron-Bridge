@@ -54,6 +54,7 @@ from megatron.bridge.data.energon.task_encoder_utils import (
     ChatMLSample,
     _images_to_pil,
     _videos_to_pil,
+    cook_chatml_sample,
 )
 from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
 from megatron.bridge.models.euro_vl.utils import ATTEND_ALL_SUBSEGMENT_ID
@@ -84,10 +85,92 @@ __all__ = [
     "EuroVLTaskSample",
     "assistant_answer_mask",
     "assistant_answer_spans",
+    "check_media_placeholders",
+    "count_media_markers",
 ]
 
 # Role name the chat template writes into an assistant turn's header.
 _ASSISTANT_ROLE = "assistant"
+
+# Conversation markers that `_structure_media_placeholders` turns into vision content items.
+_MEDIA_MARKERS = {"image": "<image>", "video": "<video>"}
+
+
+def count_media_markers(conversation: List[Dict]) -> Dict[str, int]:
+    """Count ``<image>`` / ``<video>`` markers across a conversation's turns.
+
+    Handles both shapes a turn's ``content`` can take: a raw string (the cooked form, markers
+    still inline) and a list of content items (already structured, markers became
+    ``{"type": "image"}`` entries).
+
+    Args:
+        conversation: Normalized conversation (``[{"role": ..., "content": ...}, ...]``).
+
+    Returns:
+        ``{"image": n, "video": n}``.
+    """
+    counts = {kind: 0 for kind in _MEDIA_MARKERS}
+    for turn in conversation:
+        content = turn.get("content", "")
+        if isinstance(content, str):
+            for kind, marker in _MEDIA_MARKERS.items():
+                counts[kind] += content.count(marker)
+            continue
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in counts:
+                counts[item_type] += 1
+            elif item_type == "text" and isinstance(item.get("text"), str):
+                for kind, marker in _MEDIA_MARKERS.items():
+                    counts[kind] += item["text"].count(marker)
+    return counts
+
+
+def check_media_placeholders(conversation: List[Dict], n_images: int, n_videos: int, key: str) -> None:
+    """Raise ``SkipSample`` when attached media and conversation markers do not correspond.
+
+    ``_structure_media_placeholders`` only turns a marker into vision content, and the processor
+    maps media onto those markers positionally. So a sample with an image but no ``<image>``
+    marker encodes with NO image tokens and no ``pixel_values``: it trains as text-only on a
+    question about an image, i.e. it teaches the model to answer without looking. Nothing
+    errored, which is why this went unnoticed -- verified on
+    ``image/general_qa/mminstruct_qa shard-000011.tar/mminstruct_qa-00009_002138``.
+    Fewer markers than media drops the extras the same way; more markers than media leaves a
+    literal "<image>" in the prompt. Both are data errors, so both skip loudly.
+
+    Args:
+        conversation: Normalized conversation, before or after placeholder structuring.
+        n_images: Number of attached images.
+        n_videos: Number of attached videos.
+        key: Sample key, for the warning.
+
+    Raises:
+        SkipSample: If either count disagrees with its marker count.
+    """
+    counts = count_media_markers(conversation)
+    for kind, n_media in (("image", n_images), ("video", n_videos)):
+        n_markers = counts[kind]
+        if n_media == n_markers:
+            continue
+        marker = _MEDIA_MARKERS[kind]
+        if n_markers < n_media:
+            problem = f"{n_media - n_markers} would be dropped (encoded as text-only)"
+        else:
+            problem = f"{n_markers - n_media} marker(s) would stay literal text in the prompt"
+        logging.warning(
+            "Skipping sample %s: %d %s(s) attached but %d %s marker(s) in the conversation; %s.",
+            key,
+            n_media,
+            kind,
+            n_markers,
+            marker,
+            problem,
+        )
+        raise SkipSample()
 
 
 def assistant_answer_spans(ids: List[int], tokenizer) -> List[tuple[int, int]]:
@@ -470,6 +553,17 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         if tree is not None:
             return self._encode_message_tree(sample, tree)
 
+        # Attached media must correspond 1:1 with the conversation's <image>/<video> markers;
+        # otherwise the processor silently drops media and the sample trains text-only on a
+        # question about an image. Checked before super() so nothing is decoded for a sample
+        # that is about to be skipped.
+        check_media_placeholders(
+            cook_chatml_sample(sample.conversation),
+            len(sample.imgs) if sample.imgs is not None else 0,
+            len(sample.videos) if sample.videos is not None else 0,
+            sample.__key__,
+        )
+
         encoded = super().encode_sample(sample)
 
         # Square-root per-token loss reweighting (InternVL3.5 eq. 2): scale this sample's
@@ -545,9 +639,18 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
                 if "<image>" in turn["content"] or "<video>" in turn["content"]:
                     raise ValueError(f"Message-tree sample {key}: media placeholders must be in 'shared' only")
 
+        turns = [dict(t) for t in shared] + [dict(t) for branch in branches for t in branch]
+        # Same 1:1 media/marker rule as the flat path, before any decode. The branch loop above
+        # already rejected markers outside `shared`, so this catches the counts.
+        check_media_placeholders(
+            turns,
+            len(sample.imgs) if sample.imgs is not None else 0,
+            len(sample.videos) if sample.videos is not None else 0,
+            key,
+        )
+
         images_pil = _images_to_pil(sample.imgs) if sample.imgs else None
         videos_pil = _videos_to_pil(sample.videos) if sample.videos else None
-        turns = [dict(t) for t in shared] + [dict(t) for branch in branches for t in branch]
         self._structure_media_placeholders(turns, images_pil is not None, videos_pil is not None)
         prompt_text = self.processor.apply_chat_template(turns, tokenize=False)
         proc_output = self._run_processor(prompt_text, images_pil, videos_pil, getattr(sample, "video_metadata", None))
