@@ -46,7 +46,11 @@ _SCRATCH = os.environ["SCRATCH"]
 # (rope_theta=1000000, max_position_embeddings=32768 -- NOT the stale 10000/4096 an older
 # EuroLLM-1.7B-Instruct revision carried, which would silently corrupt the frozen LLM if used).
 # Holds the tokenizer (vision tokens + chat template) and the MoonViT image-processor config.
-EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_2512_hf"
+# `_grounding`: the 2512 tokenizer plus the 10 grounding markers as single ids 128005-128014
+# (object_ref/box/point/quad/temporal). They were 7-9 context-dependent text pieces each, so a
+# labelled box cost 51 tokens and now costs 26. Ordinary text tokenizes identically and the
+# original 128005 embedding rows are bit-identical; see docs/models/euro_vl/architecture-trace.md.
+EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_2512_grounding_hf"
 # Megatron-format conversion of the above (via convert_checkpoints.py import). The training
 # loader only recognizes Megatron checkpoints for pretrained_checkpoint — pointing it at the
 # raw HF dir silently loads nothing (checkpoint_exists() is False -> random init).
@@ -59,7 +63,10 @@ EUROVL_MCORE = f"{_SCRATCH}/megatron_models/euro_vl_2b_2512_v128512"
 EUROVL_ENERGON_ROOT = os.environ.get("EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data")
 # Assembled Qwen3EuroVL oracle checkpoint (from qwen3_euro_vl_bridge.py): Qwen3-1.7B
 # LLM + MoonViT + Qwen3 tokenizer (vision tokens built in). See current.md.
-QWEN3_EUROVL_HF = f"{_SCRATCH}/hf_models/qwen3_euro_vl_2b_hf"
+# `_grounding`: Qwen3 already carries object_ref/box/quad natively (151646-151651); this adds the
+# 4 it lacks -- point/temporal start+end at 151669-151672. No resize and no vocab_size change:
+# the declared 151936 already had 267 spare embedding rows.
+QWEN3_EUROVL_HF = f"{_SCRATCH}/hf_models/qwen3_euro_vl_2b_grounding_hf"
 # Megatron-format conversion of the above (via convert_checkpoints.py import). The training
 # loader only recognizes Megatron checkpoints for pretrained_checkpoint — pointing it at the
 # raw HF dir silently loads nothing (checkpoint_exists() is False -> random init).
@@ -85,8 +92,11 @@ def _make_euro_vl_2b_provider() -> EuroVLModelProvider:
         num_attention_heads=16,
         num_query_groups=8,
         kv_channels=128,  # EuroLLM head_dim; mrope_section=[24,20,20] sums to half of this
-        # vocab_size extended: 128000 (EuroLLM) + 5 vision special tokens (128000-128004)
-        vocab_size=128005,
+        # vocab_size: 128000 (EuroLLM) + 5 vision specials (128000-128004) + 10 grounding
+        # markers (128005-128014). Must match the tokenizer: setup.py raises when the model's
+        # vocab_size is below the tokenizer's. Still <= EUROLLM_PADDED_VOCAB_SIZE, so Megatron
+        # checkpoint shapes are unchanged and existing PA/SFT checkpoints stay loadable.
+        vocab_size=128015,
         make_vocab_size_divisible_by=128,
         # Pad the (odd) 128005 vocab up to a TP-divisible size; required for TP>1
         # (VocabParallelEmbedding splits vocab across TP ranks). Harmless at TP=1.
@@ -335,13 +345,21 @@ def euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
     # than just aligning a random-init projector, and stronger weight decay (0.05 vs PA's 0.01
     # Nemotron Stage 0 value) since a full-parameter update needs more regularization than a
     # projector-only one to avoid overfitting the larger trainable surface.
+    # The schedule is RELATIVE so it follows `train.train_iters` whatever the launch sets.
+    # Baking absolute counts here (lr_warmup_iters=round(0.1*train_iters), lr_decay_iters=
+    # train_iters) silently broke long runs: both were computed from the recipe's DEFAULT
+    # train_iters=500, and a CLI override of train.train_iters does NOT recompute them -- so
+    # `train.train_iters=10000` finished the whole cosine cycle by iteration 500 and trained the
+    # remaining 95% pinned at min_lr. `lr_decay_iters=None` is resolved to train.train_iters at
+    # runtime (training/config.py), and lr_warmup_fraction is applied to that resolved value.
     opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
-        lr_warmup_iters=round(0.1 * cfg.train.train_iters),
-        lr_decay_iters=cfg.train.train_iters,
+        lr_decay_iters=None,  # -> train.train_iters, after CLI overrides
         max_lr=2e-5,
         min_lr=2e-6,
         weight_decay=0.05,
     )
+    scheduler_cfg.lr_warmup_iters = 0  # mutually exclusive with lr_warmup_fraction
+    scheduler_cfg.lr_warmup_fraction = 0.1  # 10% linear warmup, as before
     opt_cfg.use_precision_aware_optimizer = False
     opt_cfg.main_grads_dtype = torch.float32
     opt_cfg.main_params_dtype = torch.float32
@@ -633,6 +651,103 @@ def qwen3_euro_vl_sft_energon_config() -> ConfigContainer:
     cfg.logger.wandb_project = "EuroVL"
     cfg.logger.wandb_exp_name = "qwen3-sft"
     cfg.logger.wandb_save_dir = f"{EUROVL_RUNS}/qwen3_sft/wandb"
+
+    return cfg
+
+
+def qwen3_euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
+    """Qwen3EuroVL **full SFT** over the complete mixture — the Qwen3 twin of
+    :func:`euro_vl_2b_sft_config`.
+
+    :func:`qwen3_euro_vl_sft_energon_config` is a PA/oracle scaffold: caption-only
+    ``mixture_pa.yaml``, 500 iters, a PA-shaped LR. This is the real stage-2 run instead —
+    the same data and schedule as the EuroLLM full SFT, on the Qwen3 backbone:
+
+      * full ``mixture.yaml`` (every prepared dataset, repeat-factor weighted) instead of the
+        caption-only PA blend,
+      * the EuroLLM full-SFT schedule (``max_lr=2e-5``, ``min_lr=2e-6``, ``weight_decay=0.05``,
+        10% linear warmup, cosine decay over the run),
+      * the answer-trim rule (``min_answer_tokens_after_trim=128``) the EuroLLM SFT uses, so an
+        overflowing sample is trimmed rather than dropped,
+      * continuation from the Qwen3 PA checkpoint, not the random-projector base.
+
+    Everything else (packing, sqrt loss weighting, TE cross-entropy, DDP/precision, parallelism)
+    is inherited unchanged from the Qwen3 energon config, so the only deliberate differences
+    from the EuroLLM run are the backbone, tokenizer and processor.
+
+    ``train_iters`` is NOT auto-derived under packing — set it explicitly at launch, along with a
+    ``global_batch_size`` that the data-parallel size divides::
+
+        train.micro_batch_size=1 train.global_batch_size=512 train.train_iters=10000
+
+    Args:
+        seq_length: Sequence length for the model, packing and the video token budget.
+
+    Returns:
+        A :class:`ConfigContainer` for Qwen3EuroVL full SFT.
+
+    Raises:
+        FileNotFoundError: If the Qwen3 PA checkpoint is missing.
+    """
+    from megatron.bridge.data.energon.euro_vl_task_encoder import EuroVLTaskEncoder
+
+    cfg = qwen3_euro_vl_sft_energon_config()
+
+    # Stage 2 must continue from projector alignment, never from the random-init projector --
+    # same rule (and same failure mode if ignored) as the EuroLLM SFT config. `qwen3_pa_pyav_vect`
+    # is the newest Qwen3 PA run and matches the EuroLLM PA's 3720 iterations.
+    pa_run_dir = f"{EUROVL_RUNS}/qwen3_pa_pyav_vect"
+    pa_checkpoint = f"{pa_run_dir}/iter_0003720/"
+    if not os.path.exists(pa_checkpoint):
+        raise FileNotFoundError(
+            f"No Qwen3 PA checkpoint found at {pa_checkpoint!r}. Run qwen3_euro_vl_pa_sft_config "
+            "first, or point this at the PA run you want to continue from."
+        )
+    cfg.checkpoint.pretrained_checkpoint = pa_checkpoint
+    logger.info("Continuing from Qwen3 PA checkpoint: %s", cfg.checkpoint.pretrained_checkpoint)
+
+    cfg.model.seq_length = seq_length
+
+    # Full-SFT schedule, identical to euro_vl_2b_sft_config: lower peak LR than PA because this
+    # stage updates the whole model rather than aligning a projector, and stronger weight decay
+    # for the larger trainable surface.
+    opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
+        lr_decay_iters=None,  # -> train.train_iters after CLI overrides; see euro_vl_2b_sft_config
+        max_lr=2e-5,
+        min_lr=2e-6,
+        weight_decay=0.05,
+    )
+    scheduler_cfg.lr_warmup_iters = 0
+    scheduler_cfg.lr_warmup_fraction = 0.1
+    opt_cfg.use_precision_aware_optimizer = False
+    opt_cfg.main_grads_dtype = torch.float32
+    opt_cfg.main_params_dtype = torch.float32
+    opt_cfg.exp_avg_dtype = torch.float32
+    opt_cfg.exp_avg_sq_dtype = torch.float32
+    cfg.optimizer = opt_cfg
+    cfg.scheduler = scheduler_cfg
+
+    # Full blend + the EuroLLM SFT's answer-trim rule. The task encoder is rebuilt (rather than
+    # mutated) so the trim threshold goes through its constructor validation; the processor is
+    # reused, since it already carries the seq_length-derived video token budget.
+    task_encoder = EuroVLTaskEncoder(
+        processor=cfg.dataset.task_encoder.processor,
+        seq_length=seq_length,
+        sqrt_loss_weighting=True,
+        min_answer_tokens_after_trim=128,
+    )
+    cfg.dataset.task_encoder = task_encoder
+    cfg.dataset.mixture_file = os.path.join(EUROVL_ENERGON_ROOT, "mixture.yaml")
+    cfg.dataset.seq_length = seq_length
+
+    # Match the EuroLLM SFT's batch (the Qwen3 PA/oracle config uses 128). It must also be
+    # divisible by the data-parallel size: 1024 works up to 256 ranks (64 nodes x 4 GPUs).
+    cfg.train.global_batch_size = 1024
+
+    cfg.checkpoint.save = f"{EUROVL_RUNS}/qwen3_sft_full"
+    cfg.checkpoint.load = cfg.checkpoint.save  # resume from same dir (empty 1st run -> uses PA)
+    cfg.logger.wandb_exp_name = "qwen3-sft-full"
+    cfg.logger.wandb_save_dir = f"{EUROVL_RUNS}/qwen3_sft_full/wandb"
 
     return cfg
 
