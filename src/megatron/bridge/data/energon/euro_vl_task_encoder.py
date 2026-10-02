@@ -412,7 +412,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
             f = np.asarray(f)
         return Image.fromarray(f).convert("RGB")
 
-    def _frames_from_video(self, v) -> tuple[list[Image.Image], Optional[list[float]]]:
+    def _frames_from_video(self, v, key: str = "<unknown>") -> tuple[list[Image.Image], Optional[list[float]]]:
         """Sample the policy-planned number of PIL frames from whatever form the crude sample
         carries. The actual decode + frame-count planning lives on ``video_processor``
         (``decode_video_bytes`` / ``sample_frame_indices``) so the processor stays self-contained
@@ -431,7 +431,29 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
                 "(no video_processor). Build the processor with video support."
             )
         if isinstance(v, (bytes, bytearray)):
-            return vp.decode_video_bytes(v)
+            # A clip that was stream-copy cut may have no keyframe at or before the decoder's
+            # seek target, and PyAV then fails the seek with EPERM (see BUGS.md A3/B8: 746 of
+            # 102,937 subtitleqa clips, 225 of 223,239 capqa). Translate any decode failure into
+            # SkipSample so it is one warning and an explicit drop, rather than an arbitrary
+            # exception. That also protects checkpoint RESUME: energon's restore path re-runs the
+            # sample encoder with restore_error_handler=reraise_exception (packing_dataset.py), so
+            # a bad clip in the restored packing buffer would otherwise kill every resume from
+            # that checkpoint. The real fix is data-side -- re-encode the clips to start on a
+            # keyframe; three of them have no keyframe at all and can never be decoded.
+            try:
+                return vp.decode_video_bytes(v)
+            except SkipSample:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    "Skipping sample %s: video decode failed (%s: %s). Likely a clip whose first "
+                    "keyframe is after the decoder's first seek target; re-encode it to start on "
+                    "a keyframe.",
+                    key,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise SkipSample() from exc
         # energon VideoData -> .frames [T,C,H,W]; torchvision -> .vframes / tuple[0] [T,H,W,C].
         frames = getattr(v, "frames", None)
         if frames is None:
@@ -509,7 +531,7 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         video_metadata: Optional[list] = None
         if raw_videos is not None:
             # Each video -> (sampled PIL frames, per-frame timestamps in seconds).
-            decoded = [self._frames_from_video(v) for v in raw_videos]
+            decoded = [self._frames_from_video(v, sample.get("__key__", "<unknown>")) for v in raw_videos]
             videos = [frames for frames, _ in decoded]
             video_metadata = [{"timestamps": ts} for _, ts in decoded]
 

@@ -26,6 +26,7 @@ import torch
 from megatron.energon import SkipSample
 
 from megatron.bridge.data.energon.euro_vl_task_encoder import (
+    EuroVLTaskEncoder,
     assistant_answer_mask,
     assistant_answer_spans,
     check_media_placeholders,
@@ -293,3 +294,75 @@ class TestMediaPlaceholderCheck:
     def test_counts_inline_and_structured_text_parts(self):
         conv = [{"role": "user", "content": [{"type": "text", "text": "<video> then <video>"}]}]
         assert count_media_markers(conv) == {"image": 0, "video": 2}
+
+
+@pytest.mark.unit
+class TestVideoDecodeFailureSkips:
+    """A clip whose seek fails must become SkipSample, not an arbitrary PyAV exception.
+
+    Clips cut with `-c copy` can have their first keyframe after the decoder's first seek
+    target, and PyAV then fails the seek with EPERM (BUGS.md A3 / B8). Energon's normal
+    iteration would merely log the traceback, but its RESTORE path re-runs the sample encoder
+    with restore_error_handler=reraise_exception, so a bad clip sitting in a restored packing
+    buffer would kill every resume from that checkpoint. SkipSample is energon's sanctioned
+    control flow and is handled on both paths.
+    """
+
+    class _Proc:
+        """Minimal processor whose video_processor always fails to decode."""
+
+        class _VP:
+            def __init__(self, exc):
+                self._exc = exc
+
+            def decode_video_bytes(self, _data):
+                raise self._exc
+
+        def __init__(self, exc):
+            self.video_processor = self._VP(exc)
+            self.tokenizer = FakeTokenizer()
+
+    def _encoder(self, exc):
+        enc = EuroVLTaskEncoder.__new__(EuroVLTaskEncoder)  # no __init__: no real processor needed
+        enc.processor = self._Proc(exc)
+        return enc
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            PermissionError(1, "Operation not permitted"),  # what PyAV raises on a failed seek
+            ValueError("no frames decoded from video bytes"),
+            ValueError("clip exposes no container/stream duration; cannot seek-decode."),
+            RuntimeError("some other decoder failure"),
+        ],
+    )
+    def test_decode_failure_becomes_skip_sample(self, exc):
+        enc = self._encoder(exc)
+        with pytest.raises(SkipSample):
+            enc._frames_from_video(b"not-a-real-mp4", key="shard-000024.tar/9K2xEOO7rgg_g0")
+
+    def test_skip_sample_from_the_decoder_is_not_rewrapped(self):
+        enc = self._encoder(SkipSample())
+        with pytest.raises(SkipSample):
+            enc._frames_from_video(b"bytes", key="k")
+
+    def test_warning_names_the_failing_sample(self, caplog):
+        enc = self._encoder(PermissionError(1, "Operation not permitted"))
+        with caplog.at_level("WARNING"):
+            with pytest.raises(SkipSample):
+                enc._frames_from_video(b"bytes", key="shard-000002.tar/5VtOqePIlmw_g0")
+        assert "shard-000002.tar/5VtOqePIlmw_g0" in caplog.text
+        assert "keyframe" in caplog.text
+
+    def test_successful_decode_passes_through(self):
+        enc = EuroVLTaskEncoder.__new__(EuroVLTaskEncoder)
+
+        class _OK:
+            class _VP:
+                def decode_video_bytes(self, _data):
+                    return (["frame"], [0.0])
+
+            video_processor = _VP()
+
+        enc.processor = _OK()
+        assert enc._frames_from_video(b"bytes", key="k") == (["frame"], [0.0])
