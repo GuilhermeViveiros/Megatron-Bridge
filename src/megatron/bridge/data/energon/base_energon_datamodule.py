@@ -18,6 +18,12 @@ from typing import Any, Literal, Optional
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
 
+from megatron.bridge.data.energon.sharder_compat import apply_energon_sharder_fix
+
+
+# energon < 7 raises IndexError when a split has fewer samples than
+# world_size * num_workers; see sharder_compat for the upstream fix.
+apply_energon_sharder_fix()
 
 logger = logging.getLogger(__name__)
 

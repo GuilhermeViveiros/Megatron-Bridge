@@ -124,6 +124,70 @@ Deeper gradient accumulation fixes the 4-node gap entirely and most of the 8-nod
 global batch — not the code — caused the earlier apparent loss. TFLOP/s per GPU 351 / 287 / 319 at
 GBS=256 (the counter is **LLM-only**; the vision tower is not in it). Beyond 8 nodes is unmeasured.
 
+## Data loader: the energon worker-split bug (found 2026-10-03)
+
+energon cuts a split into one slice per worker, where the worker count is
+`world_size x dataset.num_workers` (4 GPUs/node x 8 workers = 32 slices/node). A split with
+fewer samples than that is legal — the trailing workers simply get nothing — but **energon
+6.0.1, the version in the container, crashes instead**:
+
+```python
+while True:                                        # flavors/webdataset/sharder.py:64
+    if end_offset <= shard_cumsums[end_index + 1]: # reads one past the array
+```
+
+When a rank's whole slice starts at the end of the data, `np.searchsorted` returns the last
+valid index and the next read is out of bounds:
+
+```
+IndexError: index 2 is out of bounds for axis 0 with size 2
+```
+
+Worked example — `mi_taco` val, 10 samples in 1 shard (`shard_cumsums = [0, 10]`, 2 entries):
+
+| | rank 15's worker offsets | outcome |
+|---|---|---|
+| 1 node (32 slices) | no rank starts at 10 | fine |
+| 4 nodes (128 slices) | `[10, 10, 10, 10, 10, 10, 10, 10, 10]` | asks for `shard_cumsums[2]` -> IndexError |
+
+So it is **scale-dependent**: the same dataset loads on few ranks and fails once enough ranks
+are added. One rank raises while the rest block in a collective until the NCCL timeout, which
+buries the real error. Measured against the live mixture (`num_workers=8`):
+
+| nodes | ranks | slices | val splits that break | train splits that break |
+|---|---|---|---|---|
+| 1 | 4 | 32 | 0 | 0 |
+| 4 | 16 | 128 | 1 | 0 |
+| 8 | 32 | 256 | 5 | 0 |
+| 16 | 64 | 512 | 13 | 1 — `handwritten_math_expr` (40) |
+| 32 | 128 | 1024 | 31 | 2 — + `mi_taco` (95) |
+| 64 | 256 | 2048 | 65 | 2 |
+
+Note the train column: **skipping validation does not fix this.** At >=16 nodes training itself
+breaks. Having fewer samples than slices is necessary but not sufficient — the bit-reversal
+permutation spares most such datasets, so the counts must be measured, not inferred (192 val
+splits sit below 2048 slices at 64 nodes but only 65 actually break).
+
+**Fix:** `data/energon/sharder_compat.py` installs upstream 7.x's bounded loop — the only
+behavioural difference between 6.0.1 and 7.3.2 in the splitting path; everything else 7.x added
+is the `subset` feature, a no-op when `subset is None`. It is gated on *feature detection* (run
+the failing case), not a version string, so it becomes a no-op once the container ships
+energon >= 7. Applied once at import of `base_energon_datamodule`, the single chokepoint every
+energon provider goes through.
+
+Verified, since a silent mis-split would be far worse than a crash — the per-worker ranges must
+tile `[0, total)` with no gap, overlap or loss:
+
+| configuration | cases | raised | partition violations |
+|---|---|---|---|
+| 6.0.1 unpatched | 2792 real + 504 synthetic | 82 / 201 | **0** |
+| 6.0.1 + backport | same | 0 | **0** |
+| 7.3.2 native | same | 0 | **0** |
+
+Patched 6.0.1 is byte-identical to native 7.3.2 on all 3296 cases, and identical to unpatched
+6.0.1 on every case the old code already handled (0 regressions; 283 crashes fixed). Unit tests:
+`tests/unit_tests/data/energon/test_sharder_compat.py` (77 tests).
+
 ## Invariants worth asserting against
 
 1. `EUROLLM_PADDED_VOCAB_SIZE` must stay >= the real vocab and divisible by every TP degree used.
@@ -137,3 +201,7 @@ GBS=256 (the counter is **LLM-only**; the vision tower is not in it). Beyond 8 n
 4. Cross-TP *resume* (weights + optimizer) needs `checkpoint.dist_ckpt_optim_fully_reshardable=true`
    set on the saving run; the error message naming `fully_parallel_save` is wrong. Weights-only
    loads (`pretrained_checkpoint`) reshard across TP freely.
+5. A data split smaller than `world_size * dataset.num_workers` must still load. energon < 7
+   raises `IndexError` in `Sharder._split_shards` instead; `data/energon/sharder_compat.py`
+   backports the upstream guard. Verify a loader change by checking the per-worker ranges tile
+   `[0, total)` exactly — a wrong split is silent, a crash is not.
