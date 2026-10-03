@@ -18,7 +18,6 @@ from megatron.bridge.recipes.euro_vl.euro_vl import (
     gemma_euro_vl_pa_sft_config,
     qwen3_euro_vl_2b_sft_config,
     qwen3_euro_vl_pa_sft_config,
-    qwen3_euro_vl_sft_energon_config,
 )
 
 
@@ -28,5 +27,4 @@ __all__ = [
     "gemma_euro_vl_pa_sft_config",
     "qwen3_euro_vl_2b_sft_config",
     "qwen3_euro_vl_pa_sft_config",
-    "qwen3_euro_vl_sft_energon_config",
 ]

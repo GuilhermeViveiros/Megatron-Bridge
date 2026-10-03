@@ -37,7 +37,7 @@
 
 set -euo pipefail
 
-RECIPE="qwen3_euro_vl_sft_energon_config"
+RECIPE="qwen3_euro_vl_2b_sft_config"
 NUM_WORKERS=8
 PACK_BUF=256
 GBS=384

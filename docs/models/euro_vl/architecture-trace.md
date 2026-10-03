@@ -53,12 +53,16 @@ start, `<` after text). A labelled box cost 51 tokens. After: one id each.
 | 128008 | `<\|box_end\|>` | | 128013 | `<\|temporal_start\|>` |
 | 128009 | `<\|point_start\|>` | | 128014 | `<\|temporal_end\|>` |
 
-Built into a NEW dir, `hf_models/euro_vl_2b_2512_grounding_hf`; the original
-`euro_vl_2b_2512_hf` is untouched. Build + verify:
+The canonical dirs `hf_models/euro_vl_2b_2512_hf` and `hf_models/qwen3_euro_vl_2b_hf` now carry
+the markers; the pre-marker tokenizers are kept as `*_pre_grounding_hf`. Qwen3 only needed 4 of
+them (`point`/`temporal` start+end at 151669-151672) because it already had object_ref/box/quad
+natively at 151646-151651, and its declared 151936 vocab had 267 spare rows, so it needed no resize
+and no `vocab_size` change. Build + verify:
 
 ```bash
-python sanity_check/build_grounding_tokenizer.py --force
-python sanity_check/test_grounding_tokenizer.py      # ~75 checks
+python sanity_check/build_grounding_tokenizer.py --force     # src/out default to the EuroLLM pair
+python sanity_check/test_grounding_tokenizer.py --family eurollm   # 64 checks
+python sanity_check/test_grounding_tokenizer.py --family qwen3     # 60 checks
 ```
 
 Measured savings: labelled box 51 -> 26 tokens, point 24 -> 14, temporal 29 -> 19, quad 33 -> 22.

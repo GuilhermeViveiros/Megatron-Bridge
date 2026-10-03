@@ -46,11 +46,12 @@ _SCRATCH = os.environ["SCRATCH"]
 # (rope_theta=1000000, max_position_embeddings=32768 -- NOT the stale 10000/4096 an older
 # EuroLLM-1.7B-Instruct revision carried, which would silently corrupt the frozen LLM if used).
 # Holds the tokenizer (vision tokens + chat template) and the MoonViT image-processor config.
-# `_grounding`: the 2512 tokenizer plus the 10 grounding markers as single ids 128005-128014
-# (object_ref/box/point/quad/temporal). They were 7-9 context-dependent text pieces each, so a
-# labelled box cost 51 tokens and now costs 26. Ordinary text tokenizes identically and the
-# original 128005 embedding rows are bit-identical; see docs/models/euro_vl/architecture-trace.md.
-EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_2512_grounding_hf"
+# Carries the 10 grounding markers as single ids 128005-128014 (object_ref/box/point/quad/
+# temporal); they were 7-9 context-dependent text pieces each, so a labelled box cost 51 tokens
+# and now costs 26. Ordinary text tokenizes identically and the original 128005 embedding rows
+# are bit-identical. The pre-marker tokenizer is kept as `euro_vl_2b_2512_pre_grounding_hf`.
+# See docs/models/euro_vl/architecture-trace.md.
+EUROVL_HF = f"{_SCRATCH}/hf_models/euro_vl_2b_2512_hf"
 # Megatron-format conversion of the above (via convert_checkpoints.py import). The training
 # loader only recognizes Megatron checkpoints for pretrained_checkpoint — pointing it at the
 # raw HF dir silently loads nothing (checkpoint_exists() is False -> random init).
@@ -63,10 +64,11 @@ EUROVL_MCORE = f"{_SCRATCH}/megatron_models/euro_vl_2b_2512_v128512"
 EUROVL_ENERGON_ROOT = os.environ.get("EUROVL_ENERGON_ROOT", "/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data")
 # Assembled Qwen3EuroVL oracle checkpoint (from qwen3_euro_vl_bridge.py): Qwen3-1.7B
 # LLM + MoonViT + Qwen3 tokenizer (vision tokens built in). See current.md.
-# `_grounding`: Qwen3 already carries object_ref/box/quad natively (151646-151651); this adds the
-# 4 it lacks -- point/temporal start+end at 151669-151672. No resize and no vocab_size change:
-# the declared 151936 already had 267 spare embedding rows.
-QWEN3_EUROVL_HF = f"{_SCRATCH}/hf_models/qwen3_euro_vl_2b_grounding_hf"
+# Qwen3 already carries object_ref/box/quad natively (151646-151651); the 4 it lacked --
+# point/temporal start+end -- were added at 151669-151672. No resize and no vocab_size change:
+# the declared 151936 already had 267 spare embedding rows. The pre-marker tokenizer is kept
+# as `qwen3_euro_vl_2b_pre_grounding_hf`.
+QWEN3_EUROVL_HF = f"{_SCRATCH}/hf_models/qwen3_euro_vl_2b_hf"
 # Megatron-format conversion of the above (via convert_checkpoints.py import). The training
 # loader only recognizes Megatron checkpoints for pretrained_checkpoint — pointing it at the
 # raw HF dir silently loads nothing (checkpoint_exists() is False -> random init).
@@ -513,8 +515,14 @@ def _make_qwen3_euro_vl_provider() -> Qwen3EuroVLModelProvider:
     )
 
 
-def qwen3_euro_vl_sft_energon_config() -> ConfigContainer:
-    """Qwen3EuroVL **oracle** SFT config — Qwen3-1.7B + MoonViT over the energon caption blend.
+def _build_qwen3_base_sft_config() -> ConfigContainer:
+    """Shared Qwen3EuroVL scaffold — Qwen3-1.7B + MoonViT over the energon blend.
+
+    Private, like :func:`_build_base_sft_config` on the EuroLLM side: the two public Qwen3
+    recipes (:func:`qwen3_euro_vl_2b_sft_config`, :func:`qwen3_euro_vl_pa_sft_config`) add the
+    stage-specific checkpoint, blend, freezing and schedule on top. Defaults here are the
+    PA-shaped ones the oracle used (caption-only ``mixture_pa.yaml``, 500 iters); do not launch
+    this directly.
 
     Validation scaffold (see ``current.md``): our vision path + recipe + data on Qwen3-VL's
     proven interleaved-M-RoPE stack, loading the assembled pretrained checkpoint
@@ -659,7 +667,7 @@ def qwen3_euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
     """Qwen3EuroVL **full SFT** over the complete mixture — the Qwen3 twin of
     :func:`euro_vl_2b_sft_config`.
 
-    :func:`qwen3_euro_vl_sft_energon_config` is a PA/oracle scaffold: caption-only
+    The shared Qwen3 scaffold is PA-shaped: caption-only
     ``mixture_pa.yaml``, 500 iters, a PA-shaped LR. This is the real stage-2 run instead —
     the same data and schedule as the EuroLLM full SFT, on the Qwen3 backbone:
 
@@ -691,7 +699,7 @@ def qwen3_euro_vl_2b_sft_config(seq_length: int = 8192) -> ConfigContainer:
     """
     from megatron.bridge.data.energon.euro_vl_task_encoder import EuroVLTaskEncoder
 
-    cfg = qwen3_euro_vl_sft_energon_config()
+    cfg = _build_qwen3_base_sft_config()
 
     # Stage 2 must continue from projector alignment, never from the random-init projector --
     # same rule (and same failure mode if ignored) as the EuroLLM SFT config. `qwen3_pa_pyav_vect`
@@ -759,7 +767,7 @@ def qwen3_euro_vl_pa_sft_config() -> ConfigContainer:
     projector so it learns to map MoonViT features into the Qwen3 embedding space — the standard
     VLM stage-1 alignment. This mirrors Qwen3-VL's own Stage 0 (train only the MLP merger, vision
     encoder + LLM frozen; arxiv 2511.21631) and the in-repo ``qwen_vl/qwen3_vl.py`` default
-    (freeze LM+vision, train projection). Built on :func:`qwen3_euro_vl_sft_energon_config` (same
+    (freeze LM+vision, train projection). Built on the shared Qwen3 scaffold (same
     model, energon ``mixture_pa.yaml`` blend, packing, sqrt loss, bounded video decode); the only
     differences are the freezing and the projector-appropriate LR/batch.
 
@@ -777,7 +785,7 @@ def qwen3_euro_vl_pa_sft_config() -> ConfigContainer:
             scripts/training/run_recipe.py --recipe qwen3_euro_vl_pa_sft_config --step_func vlm_step \\
             train.train_iters=2000 dataset.num_workers=8
     """
-    cfg = qwen3_euro_vl_sft_energon_config()
+    cfg = _build_qwen3_base_sft_config()
 
     # PA: freeze the pretrained LLM + vision tower; train only the projector.
     cfg.model.freeze_language_model = True
