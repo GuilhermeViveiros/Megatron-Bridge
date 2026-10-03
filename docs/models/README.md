@@ -11,6 +11,7 @@ Megatron Bridge conversion, training recipe links, and model-specific notes.
 | **Bailing** | [Bailing](bailing/index.md) |
 | **DeepSeek** | [DeepSeek V2](deepseek/deepseek-v2.md), [DeepSeek V3](deepseek/deepseek-v3.md), [DeepSeek V4](deepseek/deepseek-v4.md) |
 | **Falcon** | [Falcon](falcon/index.md) |
+| **EuroVL** | [EuroVL](euro_vl/index.md) |
 | **Gemma** | [Gemma 2](gemma/gemma2.md), [Gemma 3](gemma/gemma3.md), [Gemma 3 VL](gemma/gemma3-vl.md), [Gemma 4 VL](gemma/gemma4-vl.md) |
 | **GLM** | [GLM 4.5](glm/glm45.md), [GLM-4.5V](glm/glm-45v.md) |
 | **GPT-OSS** | [GPT OSS](gpt_oss/gpt-oss.md) |
