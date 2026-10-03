@@ -196,21 +196,60 @@ class MoonViTVideoProcessor(MoonViTImageProcessor):
 
             # Uniformly-spaced target times across the clip (frame-accurate: decode fwd to >= t).
             times = [duration / 2.0] if n == 1 else [i * duration / (n - 1) for i in range(n)]
-            last: Optional[Image.Image] = None
-            for t in times:
-                container.seek(int(t / stream.time_base), stream=stream, backward=True, any_frame=False)
-                picked: Optional[Image.Image] = None
-                for frame in container.decode(stream):
-                    last = frame.to_image().convert("RGB")
-                    if frame.time is not None and frame.time >= t - 1e-3:
-                        picked = last
-                        break
-                # Guarantee exactly n frames: if the seek overshot the end, reuse the last frame.
-                frames.append(picked if picked is not None else last)
+            try:
+                frames = self._decode_at_times(container, stream, times)
+            except av.error.PermissionError:
+                # Stream-copy cut clips may not start on a keyframe: everything before the first
+                # keyframe is undecodable, and a backward seek to a target there fails with EPERM.
+                # Re-space the same n targets over the decodable span [first frame, duration] and
+                # decode forward from the start in one pass (no seeks), so every frame is still the
+                # first one at/after its reported time. Seeking near the first keyframe is not
+                # reliable on these clips (it can land on the NEXT keyframe), hence no seeks here.
+                container.seek(0, stream=stream, backward=True, any_frame=False)
+                first = next(container.decode(stream), None)
+                if first is None or first.time is None or first.time >= duration:
+                    raise
+                t0 = float(first.time)
+                times = [(t0 + duration) / 2.0] if n == 1 else [t0 + i * (duration - t0) / (n - 1) for i in range(n)]
+                frames = self._decode_sequential(container, stream, times)
 
         if not frames or any(f is None for f in frames):
             raise ValueError("no frames decoded from video bytes")
         return frames, times  # type: ignore[return-value]
+
+    @staticmethod
+    def _decode_at_times(container, stream, times: list[float]) -> list[Optional[Image.Image]]:
+        """For each target time, keyframe-seek and decode forward to the first frame at/after it."""
+        frames: list[Optional[Image.Image]] = []
+        last: Optional[Image.Image] = None
+        for t in times:
+            container.seek(int(t / stream.time_base), stream=stream, backward=True, any_frame=False)
+            picked: Optional[Image.Image] = None
+            for frame in container.decode(stream):
+                last = frame.to_image().convert("RGB")
+                if frame.time is not None and frame.time >= t - 1e-3:
+                    picked = last
+                    break
+            # Guarantee exactly n frames: if the seek overshot the end, reuse the last frame.
+            frames.append(picked if picked is not None else last)
+        return frames
+
+    @staticmethod
+    def _decode_sequential(container, stream, times: list[float]) -> list[Optional[Image.Image]]:
+        """Same picking rule as ``_decode_at_times`` (first frame at/after each sorted target), in
+        one forward pass from the start of the stream instead of per-target seeks."""
+        container.seek(0, stream=stream, backward=True, any_frame=False)
+        frames: list[Optional[Image.Image]] = []
+        last = None
+        for frame in container.decode(stream):
+            last = frame
+            while len(frames) < len(times) and frame.time is not None and frame.time >= times[len(frames)] - 1e-3:
+                frames.append(frame.to_image().convert("RGB"))
+            if len(frames) == len(times):
+                break
+        # Guarantee exactly n frames: targets past the last decoded frame reuse it.
+        tail = last.to_image().convert("RGB") if last is not None else None
+        return frames + [tail] * (len(times) - len(frames))
 
     def _patchify_batch(self, images: torch.Tensor) -> torch.Tensor:
         """Batched mirror of ``MoonViTImageProcessor.patchify`` over ``[T, C, H, W]`` frames that

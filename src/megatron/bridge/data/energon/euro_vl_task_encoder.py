@@ -433,7 +433,9 @@ class EuroVLTaskEncoder(HFEncoderVLMTaskEncoder):
         if isinstance(v, (bytes, bytearray)):
             # A clip that was stream-copy cut may have no keyframe at or before the decoder's
             # seek target, and PyAV then fails the seek with EPERM (see BUGS.md A3/B8: 746 of
-            # 102,937 subtitleqa clips, 225 of 223,239 capqa). Translate any decode failure into
+            # 102,937 subtitleqa clips, 225 of 223,239 capqa). decode_video_bytes now falls back
+            # to the clip's decodable span for those; what still fails (e.g. a clip with no
+            # keyframe at all) lands here. Translate any decode failure into
             # SkipSample so it is one warning and an explicit drop, rather than an arbitrary
             # exception. That also protects checkpoint RESUME: energon's restore path re-runs the
             # sample encoder with restore_error_handler=reraise_exception (packing_dataset.py), so
