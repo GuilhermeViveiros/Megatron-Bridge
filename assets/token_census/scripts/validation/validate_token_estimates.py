@@ -28,7 +28,8 @@ duration + ``codec_context.width/height``) with zero pixel decode.
          (real seek-decode + resize).
 
 Run inside the container:
-    uv run --no-sync python assets/token_census/scripts/validate_token_estimates.py --n 30
+    python assets/token_census/scripts/validation/validate_token_estimates.py --n 30 \
+        --data-root $EUROVL_DATA_ROOT --tokenizer $EUROVL_HF
 """
 
 import argparse
@@ -45,20 +46,16 @@ from megatron.bridge.models.euro_vl.moonvit.video_processing_moonvit import _sma
 from megatron.bridge.models.euro_vl.utils import compute_moonvit_visual_tokens
 
 
-SCRATCH = os.environ["SCRATCH"]
-EUROVL_HF = f"{SCRATCH}/hf_models/euro_vl_2b_hf"
-# Shared dataset location — independent of the per-user SCRATCH env var (matches
-# sanity_check/debug_multiimage_truncation.py's DATASET_DIR convention).
-DATA_ROOT = Path("/e/scratch/e-ext-2025e01-100/EuroVL-Data/energon-data")
-IMAGE_SHARD = DATA_ROOT / "image" / "captioning" / "pixmo-cap" / "shard-000000.tar"
-VIDEO_SHARD = DATA_ROOT / "video" / "captioning" / "molmo2_cap" / "shard-000000.tar"
+# Shards checked, relative to the energon data root.
+IMAGE_SHARD = Path("image/captioning/pixmo-cap/shard-000000.tar")
+VIDEO_SHARD = Path("video/captioning/molmo2_cap/shard-000000.tar")
 
 
-def check_images(image_processor, n: int) -> bool:
+def check_images(image_processor, n: int, data_root: Path) -> bool:
     """Compare header-only analytic image tokens against the real processor, on real pixmo-cap samples."""
     mismatches = []
     checked = 0
-    with tarfile.open(IMAGE_SHARD) as tf:
+    with tarfile.open(data_root / IMAGE_SHARD) as tf:
         names = [m.name for m in tf.getmembers() if m.name.endswith(".jpg")][:n]
         for name in names:
             raw = tf.extractfile(name).read()
@@ -81,11 +78,11 @@ def check_images(image_processor, n: int) -> bool:
     return not mismatches
 
 
-def check_videos(video_processor, n: int) -> bool:
+def check_videos(video_processor, n: int, data_root: Path) -> bool:
     """Compare header-only analytic video tokens against the real processor, on real molmo2_cap samples."""
     mismatches = []
     checked = 0
-    with tarfile.open(VIDEO_SHARD) as tf:
+    with tarfile.open(data_root / VIDEO_SHARD) as tf:
         names = [m.name for m in tf.getmembers() if m.name.endswith(".mp4")][:n]
         for name in names:
             raw = tf.extractfile(name).read()
@@ -129,11 +126,15 @@ def main() -> None:
     """Assert analytic (header-only) vision-token math matches the real MoonViT processors exactly."""
     parser = argparse.ArgumentParser(description="Validate header-only analytic vision-token math")
     parser.add_argument("--n", type=int, default=30, help="Samples to check per modality")
+    parser.add_argument("--data-root", type=Path, default=os.environ.get("EUROVL_DATA_ROOT"), help="$EUROVL_DATA_ROOT")
+    parser.add_argument("--tokenizer", default=os.environ.get("EUROVL_HF"), help="model HF export ($EUROVL_HF)")
     args = parser.parse_args()
+    if args.data_root is None or args.tokenizer is None:
+        raise SystemExit("--data-root and --tokenizer (or $EUROVL_DATA_ROOT / $EUROVL_HF) are required")
 
-    processor = EuroVLProcessor.from_pretrained(EUROVL_HF, seq_length=8192)
-    ok_image = check_images(processor.image_processor, args.n)
-    ok_video = check_videos(processor.video_processor, args.n)
+    processor = EuroVLProcessor.from_pretrained(args.tokenizer, seq_length=8192)
+    ok_image = check_images(processor.image_processor, args.n, Path(args.data_root))
+    ok_video = check_videos(processor.video_processor, args.n, Path(args.data_root))
 
     if ok_image and ok_video:
         print("\nPASSED — analytic header-only math matches the real processor exactly.")

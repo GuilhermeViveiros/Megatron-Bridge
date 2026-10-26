@@ -1,0 +1,90 @@
+# Datasets whose text is multilingual, as modality/category/name (category as in mixture.yaml).
+# Source: the orange (multilingual) names of the Vision-Main tab of the team's dataset sheet, mapped to
+# mixture.yaml names and confirmed by the data owner (2026-10-26).
+#
+# Used by scripts/report/compute_language_split.py: every language the census detects is counted as
+# that language either way; this list only decides where undetermined tokens (numbers, tables, code,
+# labels) go. In these datasets they stay undetermined; in every other dataset they count as English.
+multilingual:
+  - image/chart/eurovl_docs_eurostat_charts
+  - image/chart/eurovl_docs_infographics
+  - image/chart/pangea_chartqa
+  - image/code/webmmu
+  - image/doc/c1_doclaynet_marks
+  - image/doc/eurovl_docs_eurostat_tables
+  - image/doc/eurovl_docs_receipts
+  - image/doc/eurovl_kie_cord
+  - image/doc/eurovl_kie_eurlex
+  - image/doc/eurovl_kie_fatura
+  - image/doc/eurovl_kie_sroie
+  - image/doc/eurovl_kie_wildreceipt
+  - image/doc/pangea_doc_vqa
+  - image/doc/pangea_table_vqa
+  - image/general_qa/EuroDocInt
+  - image/general_qa/c1_callout_photos_oiv7
+  - image/general_qa/pangea_laion_multi
+  - image/knowledge/culturalground_mcq
+  - image/knowledge/culturalground_oe
+  - image/knowledge/eurovl_country_image
+  - image/knowledge/eurovl_mcq_multilingual_inimage
+  - image/knowledge/wit
+  - image/math/textmath_bigmath_ml
+  - image/math/textmath_dm_math_ml
+  - image/math/textmath_gsm8k_ml
+  - image/math/textmath_math_ml
+  - image/medical/c1_callout_servier_scenes
+  - image/medical/c1_callout_servier_scenes_v3lab
+  - image/ocr/EuroOCR
+  - image/ocr/nemotron_ocr
+  - image/ocr/nemotron_ocr6
+  - image/ocr/nemotron_ocr7
+  - image/ocr/nemotron_ocr9
+  - image/ocr/nvidia_ocr_synth_enru
+  - image/ocr/pangea_mtvqa
+  - image/ocr/pangea_webui_ocr
+  - image/ocr/synthdog_multilingual_eu
+  - image/ocr/vcr_wiki_en_easy
+  - image/ocr/vcr_wiki_en_hard
+  - image/science/c1_callout_diagrams_synth
+  - image/science/c1_callout_diagrams_synth_v3fam
+  - image/science/leopard_arxiv_enriched_translated
+  - multiimage/captioning/multi_synth_cc12m_cc3m_grit
+  - multiimage/chart/eurovl_img_as_opt_chart
+  - multiimage/chart/molmo2_chart_translated
+  - multiimage/counting/eurovl_mi_oiv7_totals
+  - multiimage/doc/eurovl_img_as_opt_doc
+  - multiimage/doc/molmo2_doc
+  - multiimage/doc/molmo2_doc_translated
+  - multiimage/general_qa/EuroDocInt
+  - multiimage/general_qa/eurovl_art_style_compare
+  - multiimage/general_qa/eurovl_img_as_opt_caption
+  - multiimage/general_qa/eurovl_img_as_opt_maps
+  - multiimage/general_qa/eurovl_img_as_opt_odd_one_out
+  - multiimage/general_qa/eurovl_img_as_opt_transform
+  - multiimage/general_qa/eurovl_img_as_opt_video_frame
+  - multiimage/general_qa/eurovl_setops_composite
+  - multiimage/general_qa/eurovl_setops_photo
+  - multiimage/general_qa/molmo2_multiimageqa
+  - multiimage/general_qa/molmo2_multiimageqa_translated
+  - multiimage/general_qa/multi_synth_cc12m_cc3m_grit
+  - multiimage/gui/eurovl_img_as_opt_gui
+  - multiimage/ocr/EuroOCRMulti
+  - text/chat/euroblocks
+  - text/knowledge/eurovl_country_text
+  - text/knowledge/eurovl_home_country
+  - video/captioning/eurovideolm_v41_packed
+  - video/embodied_reasoning/alfred
+  - video/embodied_reasoning/alfred_multilingual
+  - video/general_qa/eurovideolm_qa_packed
+  - video/general_qa/eurovideolm_qa_v41_clip_packed
+  - video/general_qa/eurovideolm_qa_v41_window_packed
+  - video/grounding/ava_grounding
+  - video/grounding/ava_pointing
+  - video/grounding/ava_tracking
+  - video/grounding/sav_grounding
+  - video/grounding/sav_pointing
+  - video/grounding/sav_tracking
+  - video/spatial/zechen_clevrer_multilingual
+  - video/temporal_grounding/ava_temporal_grounding
+  - video/temporal_grounding/eurovideolm_temporal_merged_packed
+  - video/temporal_grounding/sav_temporal_grounding
