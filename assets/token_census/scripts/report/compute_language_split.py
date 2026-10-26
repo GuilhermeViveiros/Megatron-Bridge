@@ -37,6 +37,7 @@ import os
 import re
 from pathlib import Path
 
+import yaml
 from render_readme import RESULTS_DIR, default_mixture, load_rows  # same dataset set as the README
 
 
@@ -137,7 +138,20 @@ EUROLLM = EU_OFFICIAL | {"ar", "ca", "zh", "gl", "hi", "ja", "ko", "no", "ru", "
 # Samples come out "und" when there is too little natural language for langdetect: labels + coordinates
 # (grounding / pointing / counting), GUI actions, table cells, LaTeX, code. Their questions are English, so
 # (user decision 10-03) undetermined tokens of every dataset that is NOT multilingual count as English.
-MULTILINGUAL_NAME = re.compile(r"eurovideo|^ava_|^sav_|multilingual|translated|multi_synth|pangea")
+# Which datasets are multilingual is listed explicitly by the data owner.
+MULTILINGUAL_FILE = RESULTS_DIR.parent / "multilingual_datasets.yaml"
+
+
+def load_multilingual() -> set[str]:
+    """``modality/category/name`` keys of the multilingual datasets ('-' and '_' in categories are equal)."""
+    keys = (yaml.safe_load(MULTILINGUAL_FILE.read_text()) or {}).get("multilingual") or []
+    return {k.replace("-", "_") for k in keys}
+
+
+def is_multilingual(row: dict, multilingual: set[str]) -> bool:
+    """Whether a census row's dataset is in the multilingual list."""
+    return f"{row['modality']}/{row['category']}/{row['name']}".replace("-", "_") in multilingual
+
 
 DS_PATTERN = re.compile(r"^## (.+?)\s+\(total: (\d+)\)\s*$", re.M)
 ROW_PATTERN = re.compile(r"^\|\s*([^\|]+?)\s*\|\s*(\d+)\s*\|", re.M)
@@ -192,6 +206,10 @@ def main() -> None:
     if args.language_counts is None:
         raise SystemExit("--language-counts (or $EUROVL_LANGUAGE_COUNTS) is required")
     rows = load_rows(args.mixture)
+    multilingual = load_multilingual()
+    unmatched = multilingual - {f"{r['modality']}/{r['category']}/{r['name']}".replace("-", "_") for r in rows}
+    if unmatched:
+        print(f"multilingual_datasets.yaml entries with no census row: {sorted(unmatched)}")
     doc = parse_language_counts_md(args.language_counts)
     by_mod_name: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     for r in rows:
@@ -245,7 +263,7 @@ def main() -> None:
             split = {"en": float(tokens)}
             source = "assumed-en"
         und_as_en = 0.0
-        if not MULTILINGUAL_NAME.search(r["name"]) and split.get("und"):
+        if not is_multilingual(r, multilingual) and split.get("und"):
             und_as_en = split.pop("und")
             split["en"] = split.get("en", 0.0) + und_as_en
         r_w = float(r.get("mixture_r", 1.0))  # mixture repeat factor: effective = r x tokens
@@ -268,6 +286,7 @@ def main() -> None:
                 "top_languages": dict(sorted(((k, v) for k, v in split.items()), key=lambda kv: -kv[1])[:5]),
                 "languages": dict(sorted(split.items(), key=lambda kv: -kv[1])),
                 "und_counted_as_en": und_as_en,
+                "multilingual_dataset": is_multilingual(r, multilingual),
             }
         )
 

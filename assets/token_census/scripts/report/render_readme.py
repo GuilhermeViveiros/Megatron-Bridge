@@ -148,12 +148,14 @@ def render_language_section() -> str:
             "",
         ]
     moved = sum(r.get("und_counted_as_en", 0.0) for r in d.get("per_dataset", []))
+    n_ml = sum(1 for r in d.get("per_dataset", []) if r.get("multilingual_dataset"))
     if moved:
         lines += [
             f"Samples with too little natural language for detection (labels + coordinates, GUI actions, table "
             f"cells, LaTeX, code) come out undetermined; their questions are English, so in every dataset that is "
             f"**not multilingual** they are counted as **English** ({fmt_tokens(moved)}). Undetermined tokens left "
-            f"in multilingual datasets stay undetermined.",
+            f"in multilingual datasets stay undetermined. The {n_ml} multilingual datasets are listed in "
+            f"[`multilingual_datasets.yaml`](multilingual_datasets.yaml) (from the team's dataset sheet).",
             "",
         ]
     lines += [
